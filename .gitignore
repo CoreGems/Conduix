@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local config / secrets
+.env
+.env.*
+!.env.example
+
+# Local probe logs and scratch output
+scratch/
+
+# Editors / OS
+.vscode/
+.idea/
+*.stackdump
+Thumbs.db
+.DS_Store
+
+# Claude Code local settings
+.claude/settings.local.json
