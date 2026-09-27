@@ -27,7 +27,7 @@ from fastapi.responses import StreamingResponse
 from openai_codex import TextInput
 
 from conduix.backend import Event, backend
-from conduix.errors import APIError, not_found
+from conduix.errors import APIError, from_exception, from_turn_error, not_found
 from conduix.responses_store import StoredResponse, store
 from conduix.schema import Msg, ResponseCreateRequest, parse_input, split_turn
 from conduix.sessions import Session, manager
@@ -179,11 +179,11 @@ async def _sse(rs: ResponseStream, events: AsyncIterator[Event]) -> AsyncIterato
         async with aclosing(stream_response(rs, events)) as stream:
             async for e in stream:
                 yield encode_sse(e)
-    except APIError as exc:
-        yield encode_sse(rs.error_event(exc.message, code=exc.code, param=exc.param))
     except Exception as exc:  # noqa: BLE001 - never drop the connection silently
-        log.exception("stream failed")
-        yield encode_sse(rs.error_event(f"{type(exc).__name__}: {exc}", code="server_error"))
+        err = from_exception(exc)
+        if err.status >= 500:
+            log.exception("stream failed")
+        yield encode_sse(rs.error_event(err.message, code=err.code, param=err.param))
     finally:
         await events.aclose()
 
@@ -211,6 +211,5 @@ async def create_response(req: ResponseCreateRequest):
     finally:
         await events.aclose()
     if resp["status"] == "failed":
-        # step 8 maps quota/auth failures to 429/401
-        raise APIError(500, resp["error"]["message"], type="server_error", code="server_error")
+        raise from_turn_error(rs.failure)
     return resp

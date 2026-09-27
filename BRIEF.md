@@ -337,7 +337,7 @@ passes.
    collector.
 7. ✅ **`/v1/responses` route** (done 2026-09-27): stateless replay, `session_id`, and
    `previous_response_id`.
-8. **Errors**: quota/auth/upstream mapping. Streaming failures are sent as SSE
+8. ✅ **Errors** (done 2026-09-27; `/v1/models` added too): quota/auth/upstream mapping. Streaming failures are sent as SSE
    `error` events, never as a dropped connection (Conduit commit `a7ce494`).
 9. **`/v1/chat/completions`** as a translation layer over 6–7.
 10. **Images** (data URL passthrough).
@@ -390,8 +390,19 @@ tools through a prompt has no effect on disk.
   backend at all. If so, document them as advisory.
 - **Remote image URLs.** Codex has deprecated them upstream, so return a 400
   in v1 and accept data URLs only.
-- **Quota signal.** Capture a real usage-limit event from Codex and record its
-  exact shape and reset-time field before writing the matcher. Don't guess at
-  it the way the first version of `_QUOTA_MARKERS` did.
+- **Quota signal.** *Mostly settled.* Classification uses Codex's own
+  `codexErrorInfo` enum from the app-server protocol schema
+  (`usageLimitExceeded`, `rateLimitExceeded`, ...), never message text, and the
+  reset time comes from `account/rateLimits/read` (`primary`/`secondary`
+  windows with `resets_at`; live 2026-09-27: one weekly 10080-min window).
+  Still open: a real usage-limit turn has not been captured, so whether
+  Codex sets `codexErrorInfo` on `turn/completed`, on the `error`
+  notification, or only as a JSON-RPC error is unconfirmed; all three paths
+  are handled. That same RPC family can *consume* the account's free
+  rate-limit-reset credits: never call it.
+- **Upstream API errors** (found live 2026-09-27): when the OpenAI API behind
+  Codex rejects a request (e.g. invalid json_schema), the turn error's
+  message is the raw OpenAI error envelope as JSON text. `errors.py` unwraps
+  it and passes status/code/param through.
 - **ToS.** Codex is built for programmatic use of the subscription, but check
   the terms before using it heavily or unattended.

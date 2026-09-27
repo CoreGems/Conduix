@@ -390,14 +390,18 @@ Errors use OpenAI's error envelope:
 { "error": { "type": "rate_limit_exceeded", "message": "...", "code": "..." } }
 ```
 
-| Status | Meaning | What to do |
-| ------ | ------- | ---------- |
-| 400 | Bad request: unsupported `effort`, remote image URL, invalid body | Fix the request |
-| 401 / 503 | Codex is not logged in, or the login is not a ChatGPT account | Server operator runs `codex login` |
-| 404 | Unknown `session_id` / `previous_response_id` (expired or server restarted) | Start a new conversation, or resend the history (§6A) |
-| 429 | **Plan usage limit reached.** The message includes the reset time when Codex provides it | Don't retry in a loop, because it won't clear until the quota resets |
-| 429 / 503 | Transient overload | Retry with backoff (the `openai` SDK does this automatically) |
-| 500 / 502 | Codex failed during the turn | Retry once; if it persists, check server logs |
+| Status | `code` | Meaning | What to do |
+| ------ | ------ | ------- | ---------- |
+| 400 | `unsupported_value`, `model_not_found`, `invalid_json_schema`, `context_length_exceeded`, ... | Bad request: unsupported `effort`, unknown model, invalid schema, image input, conversation too long | Fix the request |
+| 401 | `codex_unauthorized` | Codex's login is no longer valid | Server operator runs `codex login` |
+| 404 | `not_found` | Unknown `session_id` / `previous_response_id` / model (expired or server restarted) | Start a new conversation, or resend the history (§6A) |
+| 429 | `usage_limit_exceeded` | **Plan usage limit reached.** The message says when it resets; `retry-after` is set and `x-should-retry: false` stops the `openai` SDK retrying | Wait for the reset; retrying won't help |
+| 429 | `rate_limit_exceeded` | Transient rate limit | Retry with backoff (the `openai` SDK does this automatically) |
+| 503 | `server_overloaded`, `codex_unavailable` | Upstream overloaded, or the Codex process died | Retry; for `codex_unavailable`, restart Conduix |
+| 500 / 502 | `server_error`, `upstream_error` | Codex failed during the turn | Retry once; if it persists, check server logs |
+
+`GET /health` shows how much of the plan's usage window is used and when it
+resets (`usage.primary.used_percent`, `resets_at`).
 
 **While streaming**, a failure arrives as an SSE `error` event before the
 stream ends, not as a dropped connection. Always handle the `error` event.

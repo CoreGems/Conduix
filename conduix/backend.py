@@ -8,8 +8,10 @@ release should only need changes here.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -130,6 +132,11 @@ class TurnError:
     # Kept unparsed until step 8 records real quota/auth shapes.
     codex_error_info: Any = None
     additional_details: str | None = None
+    resets_at: int | None = None  # filled in by run_turn for a plan-quota error
+
+
+def is_quota_error(err: TurnError) -> bool:
+    return err.codex_error_info == "usageLimitExceeded"
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +241,7 @@ class Backend:
         self.codex_version: str | None = None
         self._models: list[dict[str, Any]] = []
         self._bg: set[asyncio.Task] = set()
+        self.started_at = 0  # unix seconds; also the `created` time /v1/models reports
 
     @property
     def started(self) -> bool:
@@ -264,6 +272,7 @@ class Backend:
             raise
 
         self.account_type = info.type
+        self.started_at = int(time.time())
         self.plan_type = getattr(info.plan_type, "value", str(info.plan_type))
         server = codex.metadata.serverInfo
         # serverInfo.version is a user-agent string: "0.157.1 (Windows ...) ..."
@@ -289,12 +298,18 @@ class Backend:
         except Exception as e:  # noqa: BLE001 - health must not raise
             return {"codex": "error", "detail": f"{type(e).__name__}: {e}"}
         info = acct.root if acct is not None else None
+        rl = await self.rate_limits() or {}
+        usage = {
+            name: {k: w.get(k) for k in ("used_percent", "window_duration_mins", "resets_at")}
+            for name in ("primary", "secondary") if (w := rl.get(name))
+        }
         return {
             "codex": "ok",
             "codex_version": self.codex_version,
             "logged_in": info is not None,
             "account_type": getattr(info, "type", None),
             "plan_type": getattr(getattr(info, "plan_type", None), "value", None),
+            "usage": usage or None,
         }
 
     async def models(self) -> list[dict[str, Any]]:
@@ -309,6 +324,11 @@ class Backend:
             }
             for m in resp.data
         ]
+
+    @property
+    def cached_models(self) -> list[dict[str, Any]]:
+        """The plan's models as read at startup."""
+        return list(self._models)
 
     def resolve_model(self, model: str | None, effort: str | None = None) -> str | None:
         """Validate a model id and effort against the plan's cached model list.
@@ -332,6 +352,33 @@ class Backend:
                 f"(supported: {', '.join(entry['efforts'])})"
             )
         return model
+
+    async def rate_limits(self) -> dict[str, Any] | None:
+        """The plan's usage windows (`account/rateLimits/read`), or None.
+
+        Read-only. The same RPC family can *consume* the account's free
+        rate-limit-reset credits; Conduix never does that.
+        """
+        if self._codex is None:
+            return None
+        from openai_codex.generated.v2_all import GetAccountRateLimitsResponse
+
+        try:
+            r = await asyncio.wait_for(self._codex._client.request(
+                "account/rateLimits/read", None, response_model=GetAccountRateLimitsResponse,
+            ), timeout=5)
+        except Exception as e:  # noqa: BLE001 - informational only
+            log.warning("could not read rate limits: %s", e)
+            return None
+        return r.rate_limits.model_dump(mode="json", exclude_none=True)
+
+    async def quota_resets_at(self) -> int | None:
+        """When the exhausted usage window resets (unix seconds), if known."""
+        rl = await self.rate_limits()
+        windows = [w for w in ((rl or {}).get("primary"), (rl or {}).get("secondary")) if w]
+        full = [w for w in windows if w.get("used_percent", 0) >= 100]
+        resets = [w["resets_at"] for w in (full or windows) if w.get("resets_at")]
+        return max(resets) if resets else None
 
     def model_name(self, model: str | None) -> str:
         """The id to report for `model` (None → the plan's default model)."""
@@ -416,7 +463,7 @@ class Backend:
             async for n in handle.stream():
                 for ev in map_notification(n.method, _dump(n.payload)):
                     done = done or isinstance(ev, TurnDone)
-                    yield ev
+                    yield await self._with_reset_time(ev)
         finally:
             if not done:
                 # A separate task: on client disconnect Starlette cancels via
@@ -424,6 +471,15 @@ class Backend:
                 task = asyncio.get_running_loop().create_task(self._interrupt(handle))
                 self._bg.add(task)
                 task.add_done_callback(self._bg.discard)
+
+    async def _with_reset_time(self, ev: Event) -> Event:
+        """Attach the quota reset time to a plan-quota error."""
+        if isinstance(ev, TurnError) and is_quota_error(ev):
+            return dataclasses.replace(ev, resets_at=await self.quota_resets_at())
+        if isinstance(ev, TurnDone) and ev.error and is_quota_error(ev.error):
+            err = dataclasses.replace(ev.error, resets_at=await self.quota_resets_at())
+            return dataclasses.replace(ev, error=err)
+        return ev
 
     @staticmethod
     async def _interrupt(handle: Any) -> None:

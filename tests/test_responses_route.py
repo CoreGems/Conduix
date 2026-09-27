@@ -5,12 +5,13 @@ a dump of it ("ctx=user:A;assistant:B;..."), so tests can assert exactly what
 the model would have seen.
 """
 import json
-from types import SimpleNamespace
+import time
 
 import openai
 import pytest
 from fastapi.testclient import TestClient
 from openai import OpenAI
+from openai_codex import TransportClosedError
 
 from conduix import sessions as sessions_mod
 from conduix.app import app
@@ -24,6 +25,7 @@ from conduix.backend import (
     Usage,
 )
 from conduix.responses_store import ResponseStore
+from conduix.routes import models as models_mod
 from conduix.routes import responses as responses_mod
 from conduix.routes import sessions as routes_sessions_mod
 from conduix.sessions import SessionManager
@@ -50,6 +52,14 @@ class FakeBackend:
     def model_name(self, model):
         return model or "gpt-6-astra"
 
+    started_at = 1790000000
+    cached_models = [
+        {"id": "gpt-6-astra", "is_default": True, "default_effort": "low",
+         "efforts": ["low", "high"], "input_modalities": ["text", "image"]},
+        {"id": "gpt-5.5", "is_default": False, "default_effort": "medium",
+         "efforts": ["low", "xhigh"], "input_modalities": ["text"]},
+    ]
+
     async def start_thread(self, *, model=None, developer_instructions=None):
         t = FakeThread(f"thr_{len(self.threads)}", developer_instructions)
         self.threads.append(t)
@@ -68,6 +78,13 @@ class FakeBackend:
         thread.items += [("user", t) for t in texts]
         if "BOOM" in texts:
             raise RuntimeError("transport closed")
+        if "DEAD" in texts:
+            raise TransportClosedError("app-server exited")
+        if "QUOTA" in texts:
+            yield TurnError("You've hit your usage limit.", "usageLimitExceeded",
+                            resets_at=int(time.time()) + 3600)
+            yield TurnDone("failed")
+            return
         if "FAIL" in texts:
             yield TurnError("usage limit reached")
             yield TurnDone("failed")
@@ -88,6 +105,7 @@ def fb(monkeypatch):
     mgr = SessionManager()
     monkeypatch.setattr(sessions_mod, "backend", fb)
     monkeypatch.setattr(responses_mod, "backend", fb)
+    monkeypatch.setattr(models_mod, "backend", fb)
     monkeypatch.setattr(responses_mod, "manager", mgr)
     monkeypatch.setattr(routes_sessions_mod, "manager", mgr)
     monkeypatch.setattr(responses_mod, "store", ResponseStore())
@@ -294,3 +312,51 @@ def test_failed_turn_breaks_the_session_head(client, http, fb):
     # r1 is still continuable; it rebuilds, so the failed turn isn't in its history.
     r3 = client.responses.create(input="C", previous_response_id=r1.id)
     assert r3.output_text == f"ctx=user:A;assistant:{r1.output_text};user:C"
+
+
+# --- step 8: error mapping ---------------------------------------------------------
+
+def test_quota_is_429_with_reset_time_and_not_retried(http, fb):
+    retrying = OpenAI(base_url="http://testserver/v1", api_key="x", http_client=http)  # SDK default: 2 retries
+    with pytest.raises(openai.RateLimitError) as ei:
+        retrying.responses.create(input="QUOTA")
+    assert len(fb.turns) == 1  # x-should-retry: false honoured
+    err = ei.value
+    assert err.code == "usage_limit_exceeded"
+    assert "resets at" in err.message
+    assert err.response.headers["x-should-retry"] == "false"
+
+
+def test_quota_while_streaming_sends_error_then_response_failed(http):
+    events = sse_events(http.post("/v1/responses", json={"input": "QUOTA", "stream": True}).text)
+    assert [e["type"] for e in events[-2:]] == ["error", "response.failed"]
+    assert events[-2]["code"] == "usage_limit_exceeded" and "resets at" in events[-2]["message"]
+    assert events[-1]["response"]["error"]["code"] == "rate_limit_exceeded"
+
+
+def test_quota_stream_parses_in_openai_sdk(client):
+    with client.responses.stream(model="gpt-6-astra", input="QUOTA") as s:
+        types = [e.type for e in s]
+    assert types[-2:] == ["error", "response.failed"]
+
+
+def test_dead_app_server_is_503(client):
+    with pytest.raises(openai.InternalServerError) as ei:
+        client.responses.create(input="DEAD")
+    assert ei.value.status_code == 503 and ei.value.code == "codex_unavailable"
+
+
+def test_dead_app_server_while_streaming_is_an_error_event(http):
+    events = sse_events(http.post("/v1/responses", json={"input": "DEAD", "stream": True}).text)
+    assert events[-1]["type"] == "error" and events[-1]["code"] == "codex_unavailable"
+
+
+# --- /v1/models ----------------------------------------------------------------
+
+def test_models_list_and_retrieve(client):
+    ids = [m.id for m in client.models.list()]
+    assert ids == ["gpt-6-astra", "gpt-5.5"]
+    m = client.models.retrieve("gpt-5.5")
+    assert m.object == "model" and m.model_extra["efforts"] == ["low", "xhigh"]
+    with pytest.raises(openai.NotFoundError):
+        client.models.retrieve("gpt-4o")

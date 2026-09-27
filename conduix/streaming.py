@@ -21,6 +21,7 @@ Chat Completions chunks (step 9) will be derived from the same events.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import logging
 import time
@@ -41,6 +42,8 @@ from conduix.backend import (
     TurnError,
     Usage,
 )
+
+from conduix.errors import resolve
 
 log = logging.getLogger("conduix.streaming")
 
@@ -107,6 +110,7 @@ class ResponseStream:
         self._seq = 0
         self._items: dict[str, _Message | _Reasoning] = {}
         self._error: TurnError | None = None
+        self.failure: TurnError | None = None  # set when the turn failed
         self.finished = False
 
     # --- plumbing ------------------------------------------------------------
@@ -316,14 +320,23 @@ class ResponseStream:
             self.response["status"] = "incomplete"
             return out + [self._emit("response.incomplete", response=self._snapshot())]
 
-        err = ev.error or self._error
+        # Prefer the turn's own error; an earlier error notification may carry
+        # the codexErrorInfo when turn/completed doesn't.
+        err = ev.error or self._error or TurnError("codex turn failed")
+        early = self._error
+        if err.codex_error_info is None and early is not None and early.codex_error_info:
+            err = dataclasses.replace(err, codex_error_info=early.codex_error_info,
+                                      resets_at=err.resets_at or early.resets_at)
+        self.failure = err
+        kind, message, param = resolve(err)
         self.response["status"] = "failed"
-        # step 8 maps quota/auth to rate_limit_exceeded etc.; everything else is server_error
-        self.response["error"] = {
-            "code": "server_error",
-            "message": err.message if err else "codex turn failed",
-        }
-        return out + [self._emit("response.failed", response=self._snapshot())]
+        self.response["error"] = {"code": kind.response_code, "message": message}
+        return out + [
+            # Clients are told to watch for `error` (usage guide §11); the
+            # terminal response.failed then carries the final response.
+            self._emit("error", code=kind.code, message=message, param=param),
+            self._emit("response.failed", response=self._snapshot()),
+        ]
 
 
 def _text_part(text: str) -> dict[str, Any]:
