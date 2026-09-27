@@ -323,7 +323,7 @@ passes.
    lifespan, the chat-only thread defaults, and Codex notifications mapped
    to a small internal event type.
 4. **Schema + config**.
-5. **Sessions**: thread per session, locks, eviction.
+5. ✅ **Sessions** (done 2026-09-27; `/v1/sessions` routes and a minimal `errors.py` included): thread per session, locks, eviction.
 6. **Streaming, Responses API**: the SSE synthesizer and its non-streaming
    collector.
 7. **`/v1/responses` route**: stateless replay, `session_id`, and

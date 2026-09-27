@@ -68,6 +68,14 @@ class BillingGuardError(RuntimeError):
     """Codex is not logged in with a ChatGPT account."""
 
 
+class UnknownModelError(ValueError):
+    pass
+
+
+class UnsupportedEffortError(ValueError):
+    pass
+
+
 # --- internal events ---------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +230,7 @@ class Backend:
         self.account_type: str | None = None
         self.plan_type: str | None = None
         self.codex_version: str | None = None
+        self._models: list[dict[str, Any]] = []
 
     @property
     def started(self) -> bool:
@@ -243,11 +252,14 @@ class Backend:
                     f"Codex account is {getattr(info, 'type', 'not logged in')!r}, not 'chatgpt'. "
                     "Run `codex login` with your ChatGPT account."
                 )
+            self._codex = codex
+            # The plan's model list is fixed for the process; cache it for validation.
+            self._models = await self.models()
         except BaseException:
+            self._codex = None
             await codex.close()
             raise
 
-        self._codex = codex
         self.account_type = info.type
         self.plan_type = getattr(info.plan_type, "value", str(info.plan_type))
         server = codex.metadata.serverInfo
@@ -295,6 +307,47 @@ class Backend:
             for m in resp.data
         ]
 
+    def resolve_model(self, model: str | None, effort: str | None = None) -> str | None:
+        """Validate a model id and effort against the plan's cached model list.
+
+        Returns the model id to pass to Codex (None → Codex's default). Raises
+        UnknownModelError / UnsupportedEffortError for a 400.
+        """
+        model = model or settings().default_model
+        if not self._models:  # not started (unit tests) → nothing to check against
+            return model
+        if model is None:
+            entry = next((m for m in self._models if m["is_default"]), None)
+        else:
+            entry = next((m for m in self._models if m["id"] == model), None)
+            if entry is None:
+                ids = ", ".join(m["id"] for m in self._models)
+                raise UnknownModelError(f"model {model!r} is not available on this plan ({ids})")
+        if effort is not None and entry is not None and effort not in entry["efforts"]:
+            raise UnsupportedEffortError(
+                f"effort {effort!r} is not supported by {entry['id']} "
+                f"(supported: {', '.join(entry['efforts'])})"
+            )
+        return model
+
+    async def close_thread(self, thread_id: str) -> None:
+        """Unload a thread from app-server. Best effort.
+
+        The SDK has no wrapper for `thread/unsubscribe`, so this goes through
+        its raw typed request; the one private-API use in Conduix.
+        """
+        if self._codex is None:
+            return
+        from openai_codex.generated.v2_all import ThreadUnsubscribeResponse
+
+        try:
+            await self._codex._client.request(
+                "thread/unsubscribe", {"threadId": thread_id},
+                response_model=ThreadUnsubscribeResponse,
+            )
+        except Exception as e:  # noqa: BLE001 - closing must not raise
+            log.warning("could not unsubscribe thread %s: %s", thread_id, e)
+
     async def start_thread(
         self,
         *,
@@ -319,6 +372,7 @@ class Backend:
         thread: AsyncThread,
         input: RunInput,
         *,
+        model: str | None = None,
         effort: str | None = None,
         summary: str | None = None,
     ) -> AsyncIterator[Event]:
@@ -328,7 +382,7 @@ class Backend:
         interrupted so Codex doesn't keep spending plan quota.
         """
         handle = await thread.turn(
-            input, effort=effort or settings().default_effort, summary=summary
+            input, model=model, effort=effort or settings().default_effort, summary=summary
         )
         done = False
         try:
