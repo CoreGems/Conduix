@@ -220,6 +220,12 @@ the output item ids.
 bait ("run `dir`…") got back `NO_TOOLS`, and the workspace dir stayed empty.
 That is behavioural evidence, not proof. The step 11 tests should assert that
 no `commandExecution`, `fileChange`, or `mcpToolCall` items ever appear.
+*Done (step 11):* such items are counted in `Backend.blocked_items` (shown
+as `blocked_agent_items` on `/health`) and dropped; the live tool-bait tests
+assert the count stays zero and the workspace stays empty, and the offline
+fake-app-server tests assert the exact lockdown parameters reach
+`thread/start` (`approvalPolicy: never`, `sandbox: read-only`, the full
+`CHAT_ONLY_CONFIG`).
 
 **Continuity.** A second turn in the same thread correctly quoted the first.
 Thread state is enough for sessions.
@@ -344,8 +350,11 @@ passes.
     endpoints, and re-injected via `thread/inject_items` (`input_image` items) in resent history
     and in a `previous_response_id` rebuild. The response store is capped at 256 MB as well as
     1000 records, since stored history now carries base64 images.
-11. **Tests**: offline unit tests against a fake app-server; integration tests
+11. ✅ **Tests** (done 2026-09-27): offline unit tests against a fake app-server; integration tests
     through the `openai` SDK (`client = OpenAI(base_url="http://127.0.0.1:8766/v1", api_key="x")`).
+    `tests/fake_app_server.py` speaks the real JSON-RPC protocol (replaying responses recorded
+    from a real app-server), so backend.py and the real SDK run offline. Found: `Backend.stop()`
+    raised if the app-server had died (SDK close() on Windows); fixed.
 12. **v1.1**: custom function tools (pause/resume), web search.
 
 ### Acceptance for v1

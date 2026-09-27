@@ -16,13 +16,13 @@ which does the same for a Claude Max plan behind an Anthropic-compatible
 `/v1/messages` API. The two are designed to run side by side, with Conduit on
 `:8765` and Conduix on `:8766`.
 
-> **Status: design + probe stage.** The server is not built yet. What exists
-> today is the design ([`BRIEF.md`](./BRIEF.md)), the client guide for the
-> planned API ([`CONDUIX_API_USEAGE_GUIDE.md`](./CONDUIX_API_USEAGE_GUIDE.md)),
-> a working SDK probe (`scripts/probe_sdk.py`), and the launcher
-> (`start_app.ps1`).
+> **Status: v1 built.** Responses and Chat Completions (streaming and not),
+> multi-turn via history, `previous_response_id` or sessions, images,
+> structured output, and OpenAI-shaped errors all work against a live ChatGPT
+> plan. Function tools and web search are planned for v1.1. See
+> [`BRIEF.md`](./BRIEF.md) §6 for the build log.
 
-## Planned usage
+## Usage
 
 ```python
 from openai import OpenAI
@@ -33,7 +33,7 @@ r = client.responses.create(model="gpt-6-astra", input="Say hi in three words.")
 print(r.output_text)
 ```
 
-The planned API covers streaming, multi-turn conversations
+The API covers streaming, multi-turn conversations
 (`previous_response_id`, or the Conduix `session_id` extension), images,
 reasoning effort, errors, and limits. See the
 [usage guide](./CONDUIX_API_USEAGE_GUIDE.md) for all of these.
@@ -64,7 +64,7 @@ reasoning effort, errors, and limits. See the
 
 ```powershell
 conda create -n conduix python=3.11 -y
-conda run -n conduix pip install "openai-codex==0.157.1"
+conda run -n conduix pip install -e ".[dev]"
 ```
 
 The SDK pins and installs its own matching Codex CLI binary.
@@ -78,12 +78,27 @@ This sends three short chat-only turns through Codex and logs every event to
 conda run -n conduix --no-capture-output python scripts/probe_sdk.py
 ```
 
-### Run (once the server exists)
+### Run
 
 ```powershell
 .\start_app.ps1            # kill whatever holds :8766 (and its Codex child), then start
 .\start_app.ps1 -Reload    # dev mode
 .\start_app.ps1 -Port 9000
+```
+
+### Tests
+
+```powershell
+conda run -n conduix python -m pytest          # offline: no Codex, no quota
+```
+
+The offline suite runs the real Codex SDK against a fake app-server
+(`tests/fake_app_server.py`) and drives every route with the official
+`openai` client. The live tests spend plan quota, so they only run when asked:
+
+```powershell
+.\start_app.ps1                                # in another terminal
+conda run -n conduix python -m pytest -m integration
 ```
 
 ## Architecture

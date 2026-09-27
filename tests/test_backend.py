@@ -2,6 +2,7 @@
 import os
 
 from conduix.backend import (
+    BlockedItem,
     MessageDone,
     MessageStarted,
     ReasoningDone,
@@ -91,10 +92,10 @@ def test_error_notification_final():
     assert map_notification("error", payload) == [TurnError("boom", None, "d")]
 
 
-def test_agentic_items_are_dropped(caplog):
+def test_agentic_items_are_flagged():
     item = {"id": "c1", "type": "commandExecution", "command": "dir"}
-    assert map_notification("item/started", {"item": item, **TID}) == []
-    assert "commandExecution" in caplog.text
+    assert map_notification("item/started", {"item": item, **TID}) == [BlockedItem("commandExecution")]
+    assert map_notification("item/completed", {"item": item, **TID}) == []
 
 
 def test_unknown_methods_ignored():

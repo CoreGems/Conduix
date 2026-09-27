@@ -39,5 +39,5 @@ asyncio_mode = "auto"
 # Integration tests spend plan quota; run them explicitly with `-m integration`.
 addopts = "-m 'not integration'"
 markers = [
-  "integration: requires running Conduix server (and a ChatGPT codex login)",
+  "integration: live Codex (ChatGPT login); test_integration_server.py also needs a running server",
 ]

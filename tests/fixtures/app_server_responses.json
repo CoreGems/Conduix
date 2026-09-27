@@ -1,0 +1,442 @@
+{
+ "initialize": {
+  "serverInfo": {
+   "name": "codex_python_sdk",
+   "version": "0.157.1 (Windows 10.0.26200; x86_64) Switchyard (codex_python_sdk; 0.157.1)"
+  },
+  "userAgent": "codex_python_sdk/0.157.1 (Windows 10.0.26200; x86_64) Switchyard (codex_python_sdk; 0.157.1)",
+  "platformFamily": "windows",
+  "platformOs": "windows"
+ },
+ "account/read": {
+  "account": {
+   "email": "user@example.com",
+   "planType": "plus",
+   "type": "chatgpt"
+  },
+  "requiresOpenaiAuth": true
+ },
+ "model/list": {
+  "data": [
+   {
+    "additionalSpeedTiers": [
+     "fast"
+    ],
+    "availabilityNux": {
+     "message": "This is GPT-6, a new generation of intelligence. Astra is state-of-the-art in coding, computer use, science, and professional work. Give it a hard problem, a half-formed idea, or anything you've been meaning to build. See where it takes you."
+    },
+    "availableAccessPrograms": {
+     "cyber": [
+      "standard"
+     ]
+    },
+    "defaultReasoningEffort": "low",
+    "description": "Frontier intelligence for the most demanding work.",
+    "displayName": "GPT-6-Astra",
+    "hidden": false,
+    "id": "gpt-6-astra",
+    "inputModalities": [
+     "text",
+     "image"
+    ],
+    "isDefault": true,
+    "model": "gpt-6-astra",
+    "multiAgentVersion": "v2",
+    "serviceTiers": [
+     {
+      "description": "2x speed, increased usage",
+      "id": "priority",
+      "name": "Fast"
+     }
+    ],
+    "supportedReasoningEfforts": [
+     {
+      "description": "Fast responses with lighter reasoning",
+      "reasoningEffort": "low"
+     },
+     {
+      "description": "Balances speed and reasoning depth for everyday tasks",
+      "reasoningEffort": "medium"
+     },
+     {
+      "description": "Greater reasoning depth for complex problems",
+      "reasoningEffort": "high"
+     },
+     {
+      "description": "Extra high reasoning depth for complex problems",
+      "reasoningEffort": "xhigh"
+     },
+     {
+      "description": "Maximum reasoning depth for the hardest problems",
+      "reasoningEffort": "max"
+     },
+     {
+      "description": "Maximum reasoning with automatic task delegation",
+      "reasoningEffort": "ultra"
+     }
+    ],
+    "supportsPersonality": false
+   },
+   {
+    "additionalSpeedTiers": [
+     "fast"
+    ],
+    "availableAccessPrograms": {
+     "cyber": [
+      "standard"
+     ]
+    },
+    "defaultReasoningEffort": "medium",
+    "description": "Workhorse model for coding and everyday work.",
+    "displayName": "GPT-6-Sol",
+    "hidden": false,
+    "id": "gpt-6-sol",
+    "inputModalities": [
+     "text",
+     "image"
+    ],
+    "isDefault": false,
+    "model": "gpt-6-sol",
+    "multiAgentVersion": "v2",
+    "serviceTiers": [
+     {
+      "description": "1.5x speed",
+      "id": "priority",
+      "name": "Fast"
+     }
+    ],
+    "supportedReasoningEfforts": [
+     {
+      "description": "Fast responses with lighter reasoning",
+      "reasoningEffort": "low"
+     },
+     {
+      "description": "Balances speed and reasoning depth for everyday tasks",
+      "reasoningEffort": "medium"
+     },
+     {
+      "description": "Greater reasoning depth for complex problems",
+      "reasoningEffort": "high"
+     },
+     {
+      "description": "Extra high reasoning depth for complex problems",
+      "reasoningEffort": "xhigh"
+     },
+     {
+      "description": "Maximum reasoning depth for the hardest problems",
+      "reasoningEffort": "max"
+     },
+     {
+      "description": "Maximum reasoning with automatic task delegation",
+      "reasoningEffort": "ultra"
+     }
+    ],
+    "supportsPersonality": false
+   },
+   {
+    "additionalSpeedTiers": [
+     "fast"
+    ],
+    "availableAccessPrograms": {
+     "cyber": [
+      "standard"
+     ]
+    },
+    "defaultReasoningEffort": "medium",
+    "description": "Fast and affordable model for easier tasks.",
+    "displayName": "GPT-6-Luna",
+    "hidden": false,
+    "id": "gpt-6-luna",
+    "inputModalities": [
+     "text",
+     "image"
+    ],
+    "isDefault": false,
+    "model": "gpt-6-luna",
+    "multiAgentVersion": "v2",
+    "serviceTiers": [
+     {
+      "description": "1.5x speed",
+      "id": "priority",
+      "name": "Fast"
+     }
+    ],
+    "supportedReasoningEfforts": [
+     {
+      "description": "Fast responses with lighter reasoning",
+      "reasoningEffort": "low"
+     },
+     {
+      "description": "Balances speed and reasoning depth for everyday tasks",
+      "reasoningEffort": "medium"
+     },
+     {
+      "description": "Greater reasoning depth for complex problems",
+      "reasoningEffort": "high"
+     },
+     {
+      "description": "Extra high reasoning depth for complex problems",
+      "reasoningEffort": "xhigh"
+     },
+     {
+      "description": "Maximum reasoning depth for the hardest problems",
+      "reasoningEffort": "max"
+     }
+    ],
+    "supportsPersonality": false
+   },
+   {
+    "additionalSpeedTiers": [
+     "fast"
+    ],
+    "availableAccessPrograms": {
+     "cyber": [
+      "standard"
+     ]
+    },
+    "defaultReasoningEffort": "low",
+    "description": "Older coding model for complex work.",
+    "displayName": "GPT-5.6-Sol",
+    "hidden": false,
+    "id": "gpt-5.6-sol",
+    "inputModalities": [
+     "text",
+     "image"
+    ],
+    "isDefault": false,
+    "model": "gpt-5.6-sol",
+    "multiAgentVersion": "v2",
+    "serviceTiers": [
+     {
+      "description": "1.5x speed, increased usage",
+      "id": "priority",
+      "name": "Fast"
+     }
+    ],
+    "supportedReasoningEfforts": [
+     {
+      "description": "Fast responses with lighter reasoning",
+      "reasoningEffort": "low"
+     },
+     {
+      "description": "Balances speed and reasoning depth for everyday tasks",
+      "reasoningEffort": "medium"
+     },
+     {
+      "description": "Greater reasoning depth for complex problems",
+      "reasoningEffort": "high"
+     },
+     {
+      "description": "Extra high reasoning depth for complex problems",
+      "reasoningEffort": "xhigh"
+     },
+     {
+      "description": "Maximum reasoning depth for the hardest problems",
+      "reasoningEffort": "max"
+     },
+     {
+      "description": "Maximum reasoning with automatic task delegation",
+      "reasoningEffort": "ultra"
+     }
+    ],
+    "supportsPersonality": false
+   },
+   {
+    "additionalSpeedTiers": [
+     "fast"
+    ],
+    "availableAccessPrograms": {
+     "cyber": [
+      "standard"
+     ]
+    },
+    "defaultReasoningEffort": "medium",
+    "description": "Older balanced model for straightforward work.",
+    "displayName": "GPT-5.6-Terra",
+    "hidden": false,
+    "id": "gpt-5.6-terra",
+    "inputModalities": [
+     "text",
+     "image"
+    ],
+    "isDefault": false,
+    "model": "gpt-5.6-terra",
+    "multiAgentVersion": "v2",
+    "serviceTiers": [
+     {
+      "description": "1.5x speed, increased usage",
+      "id": "priority",
+      "name": "Fast"
+     }
+    ],
+    "supportedReasoningEfforts": [
+     {
+      "description": "Fast responses with lighter reasoning",
+      "reasoningEffort": "low"
+     },
+     {
+      "description": "Balances speed and reasoning depth for everyday tasks",
+      "reasoningEffort": "medium"
+     },
+     {
+      "description": "Greater reasoning depth for complex problems",
+      "reasoningEffort": "high"
+     },
+     {
+      "description": "Extra high reasoning depth for complex problems",
+      "reasoningEffort": "xhigh"
+     },
+     {
+      "description": "Maximum reasoning depth for the hardest problems",
+      "reasoningEffort": "max"
+     },
+     {
+      "description": "Maximum reasoning with automatic task delegation",
+      "reasoningEffort": "ultra"
+     }
+    ],
+    "supportsPersonality": false
+   },
+   {
+    "additionalSpeedTiers": [
+     "fast"
+    ],
+    "availableAccessPrograms": {
+     "cyber": [
+      "standard"
+     ]
+    },
+    "defaultReasoningEffort": "medium",
+    "description": "Older fast and efficient model.",
+    "displayName": "GPT-5.6-Luna",
+    "hidden": false,
+    "id": "gpt-5.6-luna",
+    "inputModalities": [
+     "text",
+     "image"
+    ],
+    "isDefault": false,
+    "model": "gpt-5.6-luna",
+    "multiAgentVersion": "v1",
+    "serviceTiers": [
+     {
+      "description": "1.5x speed, increased usage",
+      "id": "priority",
+      "name": "Fast"
+     }
+    ],
+    "supportedReasoningEfforts": [
+     {
+      "description": "Fast responses with lighter reasoning",
+      "reasoningEffort": "low"
+     },
+     {
+      "description": "Balances speed and reasoning depth for everyday tasks",
+      "reasoningEffort": "medium"
+     },
+     {
+      "description": "Greater reasoning depth for complex problems",
+      "reasoningEffort": "high"
+     },
+     {
+      "description": "Extra high reasoning depth for complex problems",
+      "reasoningEffort": "xhigh"
+     },
+     {
+      "description": "Maximum reasoning depth for the hardest problems",
+      "reasoningEffort": "max"
+     }
+    ],
+    "supportsPersonality": false
+   },
+   {
+    "additionalSpeedTiers": [
+     "fast"
+    ],
+    "availableAccessPrograms": {
+     "cyber": [
+      "standard"
+     ]
+    },
+    "defaultReasoningEffort": "medium",
+    "description": "Legacy coding model.",
+    "displayName": "GPT-5.5",
+    "hidden": false,
+    "id": "gpt-5.5",
+    "inputModalities": [
+     "text",
+     "image"
+    ],
+    "isDefault": false,
+    "model": "gpt-5.5",
+    "serviceTiers": [
+     {
+      "description": "1.5x speed, increased usage",
+      "id": "priority",
+      "name": "Fast"
+     }
+    ],
+    "supportedReasoningEfforts": [
+     {
+      "description": "Fast responses with lighter reasoning",
+      "reasoningEffort": "low"
+     },
+     {
+      "description": "Balances speed and reasoning depth for everyday tasks",
+      "reasoningEffort": "medium"
+     },
+     {
+      "description": "Greater reasoning depth for complex problems",
+      "reasoningEffort": "high"
+     },
+     {
+      "description": "Extra high reasoning depth for complex problems",
+      "reasoningEffort": "xhigh"
+     }
+    ],
+    "supportsPersonality": false,
+    "upgrade": "gpt-5.6-sol",
+    "upgradeInfo": {
+     "migrationMarkdown": "GPT-5.5 retires on October 14, 2026. Switch to GPT-5.6 Sol to continue working in Codex.",
+     "model": "gpt-5.6-sol",
+     "retirementAt": 1792004400
+    }
+   }
+  ]
+ },
+ "thread/start": {
+  "approvalPolicy": "never",
+  "approvalsReviewer": "user",
+  "cwd": "C:\\conduix\\workspace",
+  "disabledPluginIds": [],
+  "instructionSources": [],
+  "model": "gpt-6-astra",
+  "modelProvider": "openai",
+  "reasoningEffort": "high",
+  "sandbox": {
+   "networkAccess": false,
+   "type": "readOnly"
+  },
+  "thread": {
+   "cliVersion": "0.157.1",
+   "createdAt": 1790531646,
+   "cwd": "C:\\conduix\\workspace",
+   "ephemeral": true,
+   "historyMode": "legacy",
+   "id": "01a0e400-b3c5-7552-8d53-9237808c38ea",
+   "model": "gpt-6-astra",
+   "modelProvider": "openai",
+   "originator": "codex_python_sdk",
+   "preview": "",
+   "reasoningEffort": "high",
+   "recencyAt": 1790531646,
+   "sessionId": "01a0e400-b3c5-7552-8d53-9237808c38ea",
+   "source": "vscode",
+   "status": {
+    "type": "idle"
+   },
+   "turns": [],
+   "updatedAt": 1790531646
+  }
+ }
+}

@@ -162,6 +162,13 @@ def is_quota_error(err: TurnError) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class BlockedItem:
+    """Codex started an agentic item (shell, file edit, tool call) despite
+    chat-only mode. run_turn counts and drops it; it never reaches clients."""
+    kind: str
+
+
+@dataclass(frozen=True, slots=True)
 class TurnDone:
     status: str  # "completed" | "interrupted" | "failed"
     error: TurnError | None = None
@@ -200,7 +207,7 @@ def map_notification(method: str, payload: dict[str, Any]) -> list[Event]:
                 return [ReasoningStarted(item_id)]
             return [ReasoningDone(item_id, list(item.get("summary") or []))]
         if kind in AGENTIC_ITEM_TYPES and started:
-            log.warning("codex produced a %s item despite chat-only mode; dropped", kind)
+            return [BlockedItem(kind)]
         return []
 
     if method == "item/agentMessage/delta":
@@ -239,7 +246,7 @@ def map_notification(method: str, payload: dict[str, Any]) -> list[Event]:
 
 def _dump(obj: Any) -> dict[str, Any]:
     if hasattr(obj, "model_dump"):
-        return obj.model_dump(mode="json", exclude_none=True)
+        return obj.model_dump(mode="json", exclude_none=True, warnings=False)
     params = getattr(obj, "params", None)  # UnknownNotification
     return params if isinstance(params, dict) else {}
 
@@ -256,8 +263,13 @@ def scrub_api_keys() -> list[str]:
 # --- backend -----------------------------------------------------------------
 
 class Backend:
-    def __init__(self) -> None:
+    def __init__(self, *, launch_args: tuple[str, ...] | None = None) -> None:
+        # launch_args replaces `codex app-server` (tests run a fake app-server).
+        self._launch_args = launch_args
         self._codex: AsyncCodex | None = None
+        # Agentic items Codex started despite CHAT_ONLY_CONFIG, by type.
+        # Expected to stay empty; shown on /health.
+        self.blocked_items: dict[str, int] = {}
         self.account_type: str | None = None
         self.plan_type: str | None = None
         self.codex_version: str | None = None
@@ -275,7 +287,10 @@ class Backend:
             log.warning("removed %s from the environment; usage bills to the ChatGPT plan", k)
         s.workspace_dir.mkdir(parents=True, exist_ok=True)
 
-        codex = AsyncCodex(CodexConfig(codex_bin=s.codex_bin, cwd=str(s.workspace_dir)))
+        codex = AsyncCodex(CodexConfig(
+            codex_bin=s.codex_bin, cwd=str(s.workspace_dir),
+            launch_args_override=self._launch_args,
+        ))
         await codex.__aenter__()
         try:
             acct = (await codex.account()).account
@@ -303,8 +318,14 @@ class Backend:
 
     async def stop(self) -> None:
         codex, self._codex = self._codex, None
-        if codex is not None:
+        if codex is None:
+            return
+        try:
             await codex.close()
+        except Exception as e:  # noqa: BLE001 - shutdown must not raise
+            # e.g. OSError closing stdin of an app-server that already died
+            # (the SDK's close() doesn't expect that on Windows).
+            log.warning("closing codex app-server: %s: %s", type(e).__name__, e)
 
     @property
     def codex(self) -> AsyncCodex:
@@ -332,6 +353,7 @@ class Backend:
             "account_type": getattr(info, "type", None),
             "plan_type": getattr(getattr(info, "plan_type", None), "value", None),
             "usage": usage or None,
+            "blocked_agent_items": dict(self.blocked_items),
         }
 
     async def models(self) -> list[dict[str, Any]]:
@@ -490,6 +512,11 @@ class Backend:
         try:
             async for n in handle.stream():
                 for ev in map_notification(n.method, _dump(n.payload)):
+                    if isinstance(ev, BlockedItem):
+                        self.blocked_items[ev.kind] = self.blocked_items.get(ev.kind, 0) + 1
+                        log.warning("codex started a %s item despite chat-only mode; dropped",
+                                    ev.kind)
+                        continue
                     done = done or isinstance(ev, TurnDone)
                     yield await self._with_reset_time(ev)
         finally:

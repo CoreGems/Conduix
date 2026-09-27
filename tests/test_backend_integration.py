@@ -58,6 +58,7 @@ async def test_tool_bait_leaves_workspace_empty(be):
     events = [ev async for ev in be.run_turn(thread, prompt, effort="low")]
     assert events[-1].status == "completed"
     assert not (settings().workspace_dir / "pwned.txt").exists()
+    assert be.blocked_items == {}  # no commandExecution / fileChange / mcpToolCall at all
 
 
 async def test_models_validate_against_live_list(be):
