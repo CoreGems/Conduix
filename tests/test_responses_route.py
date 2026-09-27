@@ -391,3 +391,13 @@ def test_models_list_and_retrieve(client):
     assert m.object == "model" and m.model_extra["efforts"] == ["low", "xhigh"]
     with pytest.raises(openai.NotFoundError):
         client.models.retrieve("gpt-4o")
+
+
+def test_session_model_and_effort_are_defaults(client, http, fb):
+    sid = http.post("/v1/sessions", json={"model": "gpt-6-sol", "effort": "high"}).json()["session_id"]
+    r = client.responses.create(input="A", extra_body={"session_id": sid})
+    assert (fb.turns[-1]["model"], fb.turns[-1]["effort"]) == ("gpt-6-sol", "high")
+    assert r.model == "gpt-6-sol" and r.reasoning.effort == "high"
+    client.responses.create(model="gpt-5.5", input="B", reasoning={"effort": "low"},
+                            extra_body={"session_id": sid})
+    assert (fb.turns[-1]["model"], fb.turns[-1]["effort"]) == ("gpt-5.5", "low")

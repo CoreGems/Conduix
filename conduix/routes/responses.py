@@ -102,16 +102,22 @@ def plan(req: ResponseCreateRequest) -> Plan:
 
     effort = req.reasoning.effort if req.reasoning else None
     summary = req.reasoning.summary if req.reasoning else None
-    model = backend.resolve_model(req.model, effort)
+    requested_model = req.model
+    if req.session_id:
+        sess = manager.get(req.session_id)
+        if sess is None:
+            raise not_found(f"session {req.session_id!r} not found (expired or server restarted)",
+                            param="session_id")
+        # The session's model / effort are defaults; the request's own win.
+        requested_model = requested_model or sess.model
+        effort = effort or sess.effort
+    model = backend.resolve_model(requested_model, effort)
     msgs = parse_input(req.input)
     history, new = split_turn(msgs)
     if any(_has_images(m) for m in msgs) and not backend.supports_images(model):
         raise APIError(400, f"model {backend.model_name(model)!r} does not accept image input",
                        param="model", code="unsupported_value")
 
-    if req.session_id and manager.get(req.session_id) is None:
-        raise not_found(f"session {req.session_id!r} not found (expired or server restarted)",
-                        param="session_id")
     prev = None
     if req.previous_response_id:
         prev = store.get(req.previous_response_id)
