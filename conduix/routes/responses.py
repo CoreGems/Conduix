@@ -24,8 +24,6 @@ from typing import Any
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
-from openai_codex import TextInput
-
 from conduix.backend import Event, backend
 from conduix.errors import APIError, from_exception, from_turn_error, not_found
 from conduix.responses_store import StoredResponse, store
@@ -75,7 +73,11 @@ def plan(req: ResponseCreateRequest) -> Plan:
     effort = req.reasoning.effort if req.reasoning else None
     summary = req.reasoning.summary if req.reasoning else None
     model = backend.resolve_model(req.model, effort)
-    history, new = split_turn(parse_input(req.input))
+    msgs = parse_input(req.input)
+    history, new = split_turn(msgs)
+    if any(m.has_images for m in msgs) and not backend.supports_images(model):
+        raise APIError(400, f"model {backend.model_name(model)!r} does not accept image input",
+                       param="model", code="unsupported_value")
 
     if req.session_id and manager.get(req.session_id) is None:
         raise not_found(f"session {req.session_id!r} not found (expired or server restarted)",
@@ -111,7 +113,7 @@ async def _turn(
     already belongs to earlier stored responses; `own` is this request's."""
     await backend.inject_items(sess.thread, base + own)
     sess.head_response_id = None  # the thread is about to move on
-    turn_input = [TextInput(t) for m in p.new for t in m.texts]
+    turn_input = [part for m in p.new for part in m.parts]
     async with aclosing(backend.run_turn(
         sess.thread, turn_input, model=p.model, effort=p.effort,
         summary=p.summary, output_schema=p.output_schema,

@@ -22,9 +22,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
-from openai_codex import AsyncThread
-
-from conduix.backend import backend
+from conduix.backend import AsyncThread, backend
 from conduix.config import settings
 from conduix.errors import APIError, not_found
 

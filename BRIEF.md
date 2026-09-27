@@ -340,7 +340,10 @@ passes.
 8. ✅ **Errors** (done 2026-09-27; `/v1/models` added too): quota/auth/upstream mapping. Streaming failures are sent as SSE
    `error` events, never as a dropped connection (Conduit commit `a7ce494`).
 9. ✅ **`/v1/chat/completions`** (done 2026-09-27) as a translation layer over 6–7. v1 acceptance (§6) passes live.
-10. **Images** (data URL passthrough).
+10. ✅ **Images** (done 2026-09-27; data URL passthrough). Verified live: image as turn input on both
+    endpoints, and re-injected via `thread/inject_items` (`input_image` items) in resent history
+    and in a `previous_response_id` rebuild. The response store is capped at 256 MB as well as
+    1000 records, since stored history now carries base64 images.
 11. **Tests**: offline unit tests against a fake app-server; integration tests
     through the `openai` SDK (`client = OpenAI(base_url="http://127.0.0.1:8766/v1", api_key="x")`).
 12. **v1.1**: custom function tools (pause/resume), web search.

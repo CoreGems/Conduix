@@ -16,13 +16,19 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from openai_codex import (
+from openai_codex import (  # noqa: F401 - error types re-exported for errors.py
     ApprovalMode,
     AsyncCodex,
     AsyncThread,
     CodexConfig,
+    CodexError,
+    ImageInput,
+    JsonRpcError,
     RunInput,
     Sandbox,
+    ServerBusyError,
+    TextInput,
+    TransportClosedError,
 )
 
 from conduix.config import settings
@@ -64,6 +70,22 @@ AGENTIC_ITEM_TYPES = frozenset({
     "collabAgentToolCall", "subAgentActivity", "webSearch", "imageView",
     "imageGeneration", "sleep",
 })
+
+
+@dataclass(frozen=True, slots=True)
+class ImagePart:
+    """An image in turn input: a validated base64 `data:image/...` URL."""
+    url: str
+
+
+# A turn's input: text and image parts, in order.
+TurnInput = list[str | ImagePart]
+
+
+def _to_run_input(parts: TurnInput | RunInput) -> RunInput:
+    if isinstance(parts, list) and all(isinstance(p, (str, ImagePart)) for p in parts):
+        return [ImageInput(p.url) if isinstance(p, ImagePart) else TextInput(p) for p in parts]
+    return parts
 
 
 class BillingGuardError(RuntimeError):
@@ -330,6 +352,12 @@ class Backend:
         """The plan's models as read at startup."""
         return list(self._models)
 
+    def supports_images(self, model: str | None) -> bool:
+        model = model or settings().default_model
+        entry = next((m for m in self._models
+                      if (m["id"] == model if model else m["is_default"])), None)
+        return entry is None or "image" in entry["input_modalities"]
+
     def resolve_model(self, model: str | None, effort: str | None = None) -> str | None:
         """Validate a model id and effort against the plan's cached model list.
 
@@ -442,7 +470,7 @@ class Backend:
     async def run_turn(
         self,
         thread: AsyncThread,
-        input: RunInput,
+        input: TurnInput | RunInput,
         *,
         model: str | None = None,
         effort: str | None = None,
@@ -455,7 +483,7 @@ class Backend:
         interrupted so Codex doesn't keep spending plan quota.
         """
         handle = await thread.turn(
-            input, model=model, effort=effort or settings().default_effort, summary=summary,
+            _to_run_input(input), model=model, effort=effort or settings().default_effort, summary=summary,
             output_schema=output_schema,
         )
         done = False

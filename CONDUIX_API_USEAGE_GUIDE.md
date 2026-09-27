@@ -327,8 +327,13 @@ r = client.responses.create(
 
 For Chat Completions, use `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`.
 
-**`https://` image URLs are rejected with 400.** Download the image and send
-it as a data URL instead.
+**`https://` image URLs are rejected with 400** (`invalid_image_url`).
+Download the image and send it as a data URL instead.
+
+- Types: PNG, JPEG, GIF, WebP. Up to 20 MB per image.
+- Images can only be in `user` messages. `file_id` images are not supported.
+- Images in earlier turns are remembered: in resent history, with
+  `previous_response_id`, and in sessions.
 
 ---
 

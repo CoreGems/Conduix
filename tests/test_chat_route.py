@@ -101,7 +101,7 @@ def test_ignored_params_are_accepted(client):
     ({"messages": [{"role": "user", "content": "A"},
                    {"role": "tool", "content": "x", "tool_call_id": "1"}]}, "messages"),
     ({"messages": [{"role": "user", "content": [
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]}, "messages"),
+        {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}]}]}, "messages"),
     ({"messages": [{"role": "user", "content": "A"}, {"role": "assistant", "content": "B"}]},
      "messages"),
     ({"messages": user("A"), "n": 2}, "n"),

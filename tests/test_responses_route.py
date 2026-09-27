@@ -55,6 +55,10 @@ class FakeBackend:
     def model_name(self, model):
         return model or "gpt-6-astra"
 
+    def supports_images(self, model):
+        entry = next((m for m in self.cached_models if m["id"] == (model or "gpt-6-astra")), None)
+        return entry is None or "image" in entry["input_modalities"]
+
     started_at = 1790000000
     cached_models = [
         {"id": "gpt-6-astra", "is_default": True, "default_effort": "low",
@@ -73,12 +77,14 @@ class FakeBackend:
 
     async def inject_items(self, thread, items):
         for it in items:
-            thread.items += [(it["role"], c["text"]) for c in it["content"]]
+            thread.items += [(it["role"], c["text"] if "text" in c else f"<image {len(c['image_url'])}>")
+                             for c in it["content"]]
 
     async def run_turn(self, thread, input, **kw):
         self.turns.append(kw)
-        texts = [i.text for i in input]
-        thread.items += [("user", t) for t in texts]
+        texts = [p for p in input if isinstance(p, str)]
+        thread.items += [("user", p if isinstance(p, str) else f"<image {len(p.url)}>")
+                         for p in input]
         if "BOOM" in texts:
             raise RuntimeError("transport closed")
         if "DEAD" in texts:
@@ -272,7 +278,7 @@ def test_session_and_previous_together_is_400(client):
 @pytest.mark.parametrize("kwargs, param", [
     ({"input": [{"role": "user", "content": "A"}, {"role": "assistant", "content": "B"}]}, "input"),
     ({"input": [{"role": "user", "content": [
-        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]}]}, "input"),
+        {"type": "input_image", "image_url": "https://example.com/cat.png"}]}]}, "input"),
     ({"input": "A", "tools": [{"type": "function", "name": "f", "parameters": {}}]}, "tools"),
     ({"input": "A", "text": {"format": {"type": "json_object"}}}, "text.format.type"),
     ({"input": "A", "model": "nope"}, "model"),
