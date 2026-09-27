@@ -61,6 +61,25 @@ class _Message:
     phase: str | None
     text: str = ""
     done: bool = False
+    held: str = ""  # JSON mode: deltas held back until the message is done
+
+
+def clean_json_text(text: str) -> str:
+    """JSON mode: strip markdown code fences a model may add despite being told
+    not to, and warn if what's left isn't a JSON object."""
+    s = text.strip()
+    if s.startswith("```"):
+        s = s.split("\n", 1)[1] if "\n" in s else ""
+        if s.rstrip().endswith("```"):
+            s = s.rstrip()[:-3]
+        s = s.strip()
+    try:
+        ok = isinstance(json.loads(s), dict)
+    except ValueError:
+        ok = False
+    if not ok:
+        log.warning("JSON mode: the reply is not a JSON object: %.200r", s)
+    return s
 
 
 @dataclass
@@ -90,6 +109,7 @@ class ResponseStream:
         metadata: dict[str, str] | None = None,
         text: dict[str, Any] | None = None,
         session_id: str | None = None,
+        json_mode: bool = False,
     ) -> None:
         self.id = response_id or new_response_id()
         self.response: dict[str, Any] = {
@@ -116,6 +136,9 @@ class ResponseStream:
         }
         if session_id is not None:
             self.response["session_id"] = session_id  # Conduix extension
+        # JSON mode sends a message's text as one delta when it is done, so
+        # the streamed text and the final (fence-stripped) text always match.
+        self.json_mode = json_mode
         self._seq = 0
         self._items: dict[str, _Message | _Reasoning | _WebSearch] = {}
         self.tool_calls: list[dict[str, Any]] = []  # function_call items, in order
@@ -310,16 +333,21 @@ class ResponseStream:
 
         if isinstance(ev, TextDelta):
             m = self._items.get(ev.item_id)
+            out = []
             if not isinstance(m, _Message):
-                m_start = self._start_message(MessageStarted(ev.item_id))
-                return m_start + [self._text_delta(self._items[ev.item_id], ev.delta)]
-            return [self._text_delta(m, ev.delta)]
+                out = self._start_message(MessageStarted(ev.item_id))
+                m = self._items[ev.item_id]
+            if self.json_mode:
+                m.held += ev.delta
+                return out
+            return out + [self._text_delta(m, ev.delta)]
 
         if isinstance(ev, MessageDone):
             out = []
             if not isinstance(self._items.get(ev.item_id), _Message):
                 out = self._start_message(MessageStarted(ev.item_id))
-            return out + self._finish_message(self._items[ev.item_id], ev.text, "completed")
+            text = clean_json_text(ev.text) if self.json_mode else ev.text
+            return out + self._finish_message(self._items[ev.item_id], text, "completed")
 
         if isinstance(ev, ReasoningSummaryDelta):
             r = self._items.get(ev.item_id)
@@ -369,7 +397,8 @@ class ResponseStream:
             if item.done:
                 continue
             if isinstance(item, _Message):
-                out += self._finish_message(item, None, "incomplete")
+                held = item.held if self.json_mode and item.held else None
+                out += self._finish_message(item, held, "incomplete")
             elif isinstance(item, _WebSearch):
                 out += self._web_search(WebSearchCall(item.id, "incomplete"))
             else:

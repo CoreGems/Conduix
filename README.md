@@ -42,7 +42,7 @@ examples.
 | **Multi-turn**, three ways | Resend the history, `previous_response_id` (with branching), or the `session_id` extension | [§6](./CONDUIX_API_USEAGE_GUIDE.md#6-multi-turn-conversations) |
 | **Models and reasoning effort** | `/v1/models` lists the plan's models and each one's `effort` values; reasoning summaries | [§7](./CONDUIX_API_USEAGE_GUIDE.md#7-models-and-reasoning-effort) |
 | **Images** | Base64 data URLs (PNG / JPEG / GIF / WebP), remembered across turns | [§8](./CONDUIX_API_USEAGE_GUIDE.md#8-images) |
-| **Structured output** | `json_schema` via `text.format` / `response_format` | [§9](./CONDUIX_API_USEAGE_GUIDE.md#9-structured-output-json-schema) |
+| **Structured output** | `json_schema` via `text.format` / `response_format`, and JSON mode (`json_object`) | [§9](./CONDUIX_API_USEAGE_GUIDE.md#9-structured-output-json-schema) |
 | **Function tools** | Client-executed function calling on both endpoints, streaming included | [§10](./CONDUIX_API_USEAGE_GUIDE.md#10-function-tools) |
 | **Web search** | `tools: [{"type": "web_search"}]`, or `web_search_options` in Chat Completions | [§11](./CONDUIX_API_USEAGE_GUIDE.md#11-web-search) |
 | **Usage** | OpenAI-style token counts; `/health` shows how much of the plan's usage window is used | [§12](./CONDUIX_API_USEAGE_GUIDE.md#12-usage-and-token-counts) |

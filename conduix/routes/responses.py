@@ -60,6 +60,7 @@ class Plan:
     tools: list[dict[str, Any]] = field(default_factory=list)  # Codex dynamic tool specs
     web_search: bool = False
     tool_called: bool = False  # set when the turn ended on a function call
+    json_mode: bool = False  # text.format json_object
 
     @property
     def tools_key(self) -> str:
@@ -75,17 +76,35 @@ def _has_images(item: Item) -> bool:
     return False
 
 
-def _output_schema(text: dict[str, Any] | None) -> dict[str, Any] | None:
+# JSON mode can't be a schema: Codex's upstream accepts only strict schemas
+# (`additionalProperties: false` required), so "any object" isn't expressible.
+# It is an instruction on the turn instead (verified live: replies parse).
+JSON_MODE_HINT = ("Respond with a single valid JSON object and nothing else: no prose, "
+                  "no markdown code fences.")
+
+
+def _output_schema(text: dict[str, Any] | None) -> tuple[dict[str, Any] | None, bool]:
+    """(Codex output_schema, JSON mode) for `text.format`."""
     fmt = (text or {}).get("format") or {}
     kind = fmt.get("type", "text")
     if kind == "text":
-        return None
+        return None, False
+    if kind == "json_object":
+        return None, True
     if kind == "json_schema":
-        if not isinstance(fmt.get("schema"), dict):
+        schema = fmt.get("schema")
+        if not isinstance(schema, dict):
             raise APIError(400, "text.format.schema is required", param="text.format.schema")
-        return fmt["schema"]
-    raise APIError(400, f"text.format type {kind!r} is not supported; use json_schema",
-                   param="text.format.type")
+        if (schema.get("type") == "object" and not schema.get("properties")
+                and schema.get("additionalProperties") is False):
+            # Found live: a schema that only allows `{}` never finishes; the
+            # model starts its answer and produces nothing until cut off.
+            raise APIError(400, "the schema only allows an empty object; give it properties, "
+                           'or use {"type": "json_object"}', param="text.format.schema",
+                           code="invalid_json_schema")
+        return schema, False
+    raise APIError(400, f"text.format type {kind!r} is not supported; use json_schema or "
+                   "json_object", param="text.format.type")
 
 
 def plan(req: ResponseCreateRequest) -> Plan:
@@ -132,8 +151,9 @@ def plan(req: ResponseCreateRequest) -> Plan:
                 param="previous_response_id",
             )
     check_tool_outputs(msgs, store.history(prev.id) if prev else [])
-    return Plan(req, model, effort, summary, _output_schema(req.text), history, new, prev,
-                tools=tools, web_search=web_search)
+    output_schema, json_mode = _output_schema(req.text)
+    return Plan(req, model, effort, summary, output_schema, history, new, prev,
+                tools=tools, web_search=web_search, json_mode=json_mode)
 
 
 def _output_items(rs: ResponseStream) -> list[dict[str, Any]]:
@@ -157,6 +177,9 @@ async def _turn(
     await backend.inject_items(sess.thread, base + own)
     sess.head_response_id = None  # the thread is about to move on
     turn_input = [part for m in p.new for part in m.parts]
+    if p.json_mode:
+        # On the turn, not the thread: later turns aren't held to JSON.
+        turn_input.append(JSON_MODE_HINT)
     async with aclosing(backend.run_turn(
         sess.thread, turn_input, model=p.model, effort=p.effort,
         summary=p.summary, output_schema=p.output_schema, allow_web_search=p.web_search,
@@ -255,6 +278,7 @@ async def create_response(req: ResponseCreateRequest):
         metadata=req.metadata,
         text=req.text,
         session_id=req.session_id,
+        json_mode=p.json_mode,
     )
     events = run_events(p, rs)
     if req.stream:

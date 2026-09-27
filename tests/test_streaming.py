@@ -186,3 +186,19 @@ def test_encode_sse():
     frame = encode_sse({"type": "response.output_text.delta", "delta": "é"})
     assert frame.startswith("event: response.output_text.delta\ndata: ")
     assert frame.endswith("\n\n") and "é" in frame
+
+
+def test_clean_json_text():
+    from conduix.streaming import clean_json_text
+    assert clean_json_text('```json\n{"a": 1}\n```') == '{"a": 1}'
+    assert clean_json_text('```\n{"a": 1}```') == '{"a": 1}'
+    assert clean_json_text('  {"a": 1}\n') == '{"a": 1}'
+    assert clean_json_text("not json") == "not json"  # left as is (and logged)
+
+
+async def test_json_mode_incomplete_message_keeps_held_text():
+    rs = ResponseStream(model="m", json_mode=True)
+    out = [e async for e in stream_response(rs, aiter([
+        MessageStarted("m1"), TextDelta("m1", '{"a"'), TurnDone("interrupted")]))]
+    assert [e["delta"] for e in out if e["type"] == "response.output_text.delta"] == ['{"a"']
+    assert rs.output_text == '{"a"'

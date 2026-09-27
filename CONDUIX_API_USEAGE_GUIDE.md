@@ -426,9 +426,32 @@ r = client.responses.create(
 Completions, use `response_format={"type": "json_schema", "json_schema":
 {"name": ..., "schema": ...}}`.
 
-Only `json_schema` is supported; `{"type": "json_object"}` returns 400. An
-invalid schema returns **400** `invalid_json_schema`, with the upstream
-message.
+An invalid schema returns **400** `invalid_json_schema`, with the upstream
+message. Two rules come from the upstream API:
+- Schemas must be strict (`additionalProperties: false`).
+- A schema that only allows an empty object is rejected up front, because
+  the model can't finish such a reply.
+
+### JSON mode
+
+`text={"format": {"type": "json_object"}}` (Chat Completions:
+`response_format={"type": "json_object"}`) asks for a JSON object without a
+fixed schema:
+
+```python
+r = client.responses.create(model="gpt-6-astra", text={"format": {"type": "json_object"}},
+                            input="Give me three fun facts about octopuses.")
+facts = json.loads(r.output_text)   # e.g. {"facts": [...]}
+```
+
+It works differently from api.openai.com:
+- **Instructed, not guaranteed.** Codex can't express "any JSON object" as a
+  schema, so Conduix tells the model, for that turn only, to answer with one
+  JSON object. It then strips any markdown code fences. In testing every
+  reply parsed, but it isn't guaranteed like `json_schema` is. Parse
+  defensively, or use `json_schema` when the shape is known.
+- **One chunk when streaming.** The text arrives as a single delta once the
+  answer is complete, so the streamed text always matches the final text.
 
 ---
 
@@ -589,7 +612,7 @@ Errors use OpenAI's error envelope:
 | `temperature`, `top_p`, `stop`, `max_output_tokens`, `max_tokens`, `seed`, `user`, `parallel_tool_calls`, `logprobs` | Accepted and **ignored**: Codex has no setting for them |
 | `metadata` | Echoed back in the response |
 | `n` > 1 (Chat Completions) | 400 |
-| `text.format` / `response_format` `json_object` | 400; use `json_schema` |
+| `text.format` / `response_format` `json_object` | Supported, but instructed rather than guaranteed (§9, "JSON mode") |
 | `tool_choice` `"required"` or a named function | Behaves like `"auto"` |
 | Web search citations | Markdown links in the text; no `url_citation` annotations |
 | Other hosted tools (file search, code interpreter, MCP, computer use) | 400 |

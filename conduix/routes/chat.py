@@ -101,7 +101,7 @@ def _text(response_format: dict[str, Any] | None) -> dict[str, Any] | None:
     if kind == "json_schema":
         spec = response_format.get("json_schema") or {}
         return {"format": {"type": "json_schema", **spec}}
-    return {"format": {"type": kind}}  # "text" passes; "json_object" gets the 400
+    return {"format": {"type": kind}}  # "text", "json_object"; anything else gets a 400
 
 
 def to_responses_request(req: ChatCompletionRequest) -> ResponseCreateRequest:
@@ -165,7 +165,7 @@ async def create_chat_completion(req: ChatCompletionRequest):
         raise APIError(400, str(exc), param="reasoning_effort",
                        code="unsupported_value") from exc
     model = backend.model_name(p.model)
-    rs = ResponseStream(model=model, session_id=req.session_id)
+    rs = ResponseStream(model=model, session_id=req.session_id, json_mode=p.json_mode)
     events = run_events(p, rs)
 
     if req.stream:

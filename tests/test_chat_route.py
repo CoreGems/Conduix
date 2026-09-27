@@ -105,7 +105,10 @@ def test_ignored_params_are_accepted(client):
     ({"messages": [{"role": "user", "content": "A"}, {"role": "assistant", "content": "B"}]},
      "messages"),
     ({"messages": user("A"), "n": 2}, "n"),
-    ({"messages": user("A"), "response_format": {"type": "json_object"}}, "response_format.type"),
+    ({"messages": user("A"), "response_format": {"type": "xml"}}, "response_format.type"),
+    ({"messages": user("A"), "response_format": {"type": "json_schema", "json_schema": {
+        "name": "e", "schema": {"type": "object", "properties": {}, "additionalProperties": False}}}},
+     "response_format.json_schema.schema"),
     ({"messages": user("A"), "reasoning_effort": "bogus"}, "reasoning_effort"),
 ])
 def test_bad_requests_are_400(client, kwargs, param):

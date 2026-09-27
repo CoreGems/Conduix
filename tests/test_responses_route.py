@@ -120,6 +120,8 @@ class FakeBackend:
             yield TurnDone("failed")
             return
         reply = "ctx=" + ";".join(f"{r}:{t}" for r, t in thread.items)
+        if "FENCED" in texts:
+            reply = '```json\n{"a": 1}\n```'
         thread.items.append(("assistant", reply))
         yield MessageStarted("msg_1", "final_answer")
         yield TextDelta("msg_1", reply[:5])
@@ -302,7 +304,9 @@ def test_session_and_previous_together_is_400(client):
         {"type": "input_image", "image_url": "https://example.com/cat.png"}]}]}, "input"),
     ({"input": "A", "tools": [{"type": "file_search", "vector_store_ids": ["v"]}]}, "tools[0].type"),
     ({"input": "A", "tools": [{"type": "function", "name": "bad name!"}]}, "tools[0].name"),
-    ({"input": "A", "text": {"format": {"type": "json_object"}}}, "text.format.type"),
+    ({"input": "A", "text": {"format": {"type": "xml"}}}, "text.format.type"),
+    ({"input": "A", "text": {"format": {"type": "json_schema", "name": "e", "schema": {
+        "type": "object", "properties": {}, "additionalProperties": False}}}}, "text.format.schema"),
     ({"input": "A", "model": "nope"}, "model"),
 ])
 def test_bad_requests_are_400(client, kwargs, param):
@@ -401,3 +405,45 @@ def test_session_model_and_effort_are_defaults(client, http, fb):
     client.responses.create(model="gpt-5.5", input="B", reasoning={"effort": "low"},
                             extra_body={"session_id": sid})
     assert (fb.turns[-1]["model"], fb.turns[-1]["effort"]) == ("gpt-5.5", "low")
+
+
+# --- JSON mode (text.format json_object) ------------------------------------------
+
+JSON_MODE = {"format": {"type": "json_object"}}
+
+
+def test_json_mode_is_an_instruction_on_the_turn(client, fb):
+    r = client.responses.create(input="A", text=JSON_MODE)
+    assert fb.turns[-1]["output_schema"] is None
+    assert fb.threads[-1].items[-2] == ("user", responses_mod.JSON_MODE_HINT)
+    assert r.text.format.type == "json_object"
+
+
+def test_json_mode_strips_code_fences(client):
+    r = client.responses.create(input="FENCED", text=JSON_MODE)
+    assert r.output_text == '{"a": 1}'
+
+
+def test_json_mode_stream_sends_one_clean_delta(http):
+    events = sse_events(http.post("/v1/responses", json={
+        "input": "FENCED", "text": JSON_MODE, "stream": True}).text)
+    deltas = [e["delta"] for e in events if e["type"] == "response.output_text.delta"]
+    done = next(e["text"] for e in events if e["type"] == "response.output_text.done")
+    assert deltas == ['{"a": 1}'] and done == '{"a": 1}'
+
+
+def test_json_mode_hint_is_not_sticky(client, fb):
+    r1 = client.responses.create(input="A", text=JSON_MODE)
+    client.responses.create(input="B", previous_response_id=r1.id)
+    hints = [t for _, t in fb.threads[-1].items if t == responses_mod.JSON_MODE_HINT]
+    assert len(hints) == 1  # only on the JSON-mode turn
+
+
+def test_chat_json_mode(client):
+    c = client.chat.completions.create(model="gpt-6-astra", response_format={"type": "json_object"},
+                                       messages=[{"role": "user", "content": "FENCED"}])
+    assert c.choices[0].message.content == '{"a": 1}'
+    chunks = list(client.chat.completions.create(
+        model="gpt-6-astra", response_format={"type": "json_object"}, stream=True,
+        messages=[{"role": "user", "content": "FENCED"}]))
+    assert "".join(ch.choices[0].delta.content or "" for ch in chunks if ch.choices) == '{"a": 1}'
