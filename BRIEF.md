@@ -171,7 +171,9 @@ memory.
 `plan_type: "plus"`, with `requires_openai_auth: true`. That is subscription
 auth, not API-key auth. The shell also had `OPENAI_API_KEY` set, which the
 probe's guard caught. The server must **remove it from the Codex process's
-environment** (`CodexConfig.env`) and not rely on the user unsetting it.
+environment** and not rely on the user unsetting it. (`CodexConfig.env` is
+merged *over* `os.environ`, so it can't remove a key: the server deletes the
+keys from its own environment before spawning Codex. See `scrub_api_keys()`.)
 
 **Models for this plan** (`codex.models()`):
 
@@ -300,7 +302,8 @@ start_app.ps1       kill (whole process tree) and restart on port
 **Billing guard:** at startup, call `codex.account()` and refuse to serve
 unless `account.type == "chatgpt"`. Log `plan_type` and show it on
 `/health`. Always start Codex with an environment that has `OPENAI_API_KEY`
-(and `CODEX_API_KEY`) **removed** (`CodexConfig.env`). The key really is set
+(and `CODEX_API_KEY`) **removed** from the server's own `os.environ`, which
+the Codex child inherits (`CodexConfig.env` can only add or override). The key really is set
 in the user's shell, so the server strips it instead of failing. This mirrors
 Conduit's "leave `ANTHROPIC_API_KEY` unset" rule, but here it is enforced in
 code instead of only documented.
@@ -312,11 +315,11 @@ code instead of only documented.
 Each step is independently verifiable. Do not start step N+1 until step N
 passes.
 
-1. **Bootstrap**: pyproject, conda env, `/health`.
+1. ✅ **Bootstrap** (done 2026-09-27): pyproject, conda env, `/health`.
 2. ✅ **Probe the SDK** (done 2026-09-26): `scripts/probe_sdk.py`, with results
    in §3.1. Still to do: probe reasoning summaries at higher effort, the error
    and quota notification shapes, and one image turn.
-3. **`backend.py`**: a single `AsyncCodex` started and closed in the FastAPI
+3. ✅ **`backend.py`** (done 2026-09-27; `config.py` pulled forward from step 4): a single `AsyncCodex` started and closed in the FastAPI
    lifespan, the chat-only thread defaults, and Codex notifications mapped
    to a small internal event type.
 4. **Schema + config**.

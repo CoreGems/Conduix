@@ -36,6 +36,8 @@ packages = ["conduix"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Integration tests spend plan quota; run them explicitly with `-m integration`.
+addopts = "-m 'not integration'"
 markers = [
   "integration: requires running Conduix server (and a ChatGPT codex login)",
 ]

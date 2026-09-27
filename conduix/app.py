@@ -1,42 +1,49 @@
 """Conduix FastAPI app — OpenAI-compatible local API."""
 from __future__ import annotations
 
-import os
-from importlib.metadata import PackageNotFoundError, version
+import logging
+from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 
 from conduix import __version__
+from conduix.backend import backend
+from conduix.config import settings
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s: %(message)s")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Fails startup (BillingGuardError) if Codex isn't logged in with ChatGPT.
+    await backend.start()
+    try:
+        yield
+    finally:
+        await backend.stop()
+
 
 app = FastAPI(
     title="Conduix",
     version=__version__,
     description="OpenAI-compatible local API, powered by the openai-codex SDK.",
+    lifespan=lifespan,
 )
 
 
-def _pkg_version(name: str) -> str | None:
-    try:
-        return version(name)
-    except PackageNotFoundError:
-        return None
-
-
 @app.get("/health", tags=["meta"])
-async def health() -> dict[str, str | None]:
-    # Codex login / plan status is added in step 3, once backend.py owns AsyncCodex.
+async def health() -> dict[str, Any]:
+    status = await backend.status()
     return {
-        "status": "ok",
+        "status": "ok" if status.get("codex") == "ok" else "degraded",
         "version": __version__,
-        "openai_codex": _pkg_version("openai-codex"),
+        **status,
     }
 
 
 def main() -> None:
     import uvicorn
 
-    uvicorn.run(
-        "conduix.app:app",
-        host=os.environ.get("CONDUIX_HOST", "127.0.0.1"),
-        port=int(os.environ.get("CONDUIX_PORT", "8766")),
-    )
+    s = settings()
+    uvicorn.run("conduix.app:app", host=s.host, port=s.port)
