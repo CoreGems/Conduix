@@ -92,7 +92,8 @@ function Stop-OnPort([int]$p) {
 }
 
 if (-not (Test-Path (Join-Path $PSScriptRoot 'conduix\app.py'))) {
-    Write-Error "[start] conduix\app.py not found - the server hasn't been built yet (see BRIEF.md section 6)."
+    Write-Host "[start] conduix\app.py not found - the server hasn't been built yet (see BRIEF.md section 6)." -ForegroundColor Red
+    exit 1
 }
 
 Stop-OnPort -p $Port

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "conduix"
+version = "0.1.0"
+description = "OpenAI-compatible local API server, powered by the openai-codex SDK"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "alex buz" }]
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "sse-starlette>=2.1",
+  # Pinned exactly: the SDK pins its Codex binary and app-server is experimental.
+  "openai-codex==0.157.1",
+  "openai>=1.50",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "httpx>=0.27",
+]
+
+[project.scripts]
+conduix = "conduix.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["conduix"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+  "integration: requires running Conduix server (and a ChatGPT codex login)",
+]
