@@ -371,3 +371,113 @@ async def collect_response(rs: ResponseStream, events: AsyncIterator[Event]) -> 
 def encode_sse(event: dict[str, Any]) -> str:
     """One Responses stream event as an SSE frame (`event:` = its type)."""
     return f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+# --- Chat Completions (step 9) ------------------------------------------------
+#
+# Derived from the Responses events above rather than from backend events, so
+# ordering, failure handling and item bookkeeping live in one place. Chat has
+# no reasoning items: they are dropped. Several message items (rare in
+# chat-only mode) are joined with a blank line.
+
+def new_completion_id() -> str:
+    return f"chatcmpl-{uuid.uuid4().hex}"
+
+
+def chat_usage(usage: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not usage:
+        return None
+    return {
+        "prompt_tokens": usage["input_tokens"],
+        "completion_tokens": usage["output_tokens"],
+        "total_tokens": usage["total_tokens"],
+        "prompt_tokens_details": {
+            "cached_tokens": usage["input_tokens_details"]["cached_tokens"],
+            "cache_write_tokens": usage["input_tokens_details"]["cache_write_tokens"],
+        },
+        "completion_tokens_details": {
+            "reasoning_tokens": usage["output_tokens_details"]["reasoning_tokens"],
+        },
+    }
+
+
+def _message_texts(response: dict[str, Any]) -> list[str]:
+    return [
+        "".join(c["text"] for c in item["content"] if c["type"] == "output_text")
+        for item in response["output"] if item["type"] == "message"
+    ]
+
+
+def chat_completion(response: dict[str, Any], *, completion_id: str | None = None) -> dict[str, Any]:
+    """Non-streaming: a finished Responses `response` as a `chat.completion`."""
+    out = {
+        "id": completion_id or new_completion_id(),
+        "object": "chat.completion",
+        "created": response["created_at"],
+        "model": response["model"],
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "\n\n".join(_message_texts(response)),
+                        "refusal": None, "annotations": []},
+            "finish_reason": "stop",
+            "logprobs": None,
+        }],
+        "usage": chat_usage(response["usage"]),
+        "system_fingerprint": None,
+    }
+    if "session_id" in response:
+        out["session_id"] = response["session_id"]
+    return out
+
+
+class ChatStream:
+    """Responses stream events in, `chat.completion.chunk` dicts out.
+
+    A Responses `error` event is not translated here: the route turns it into
+    OpenAI's in-stream error payload, `{"error": {...}}`.
+    """
+
+    def __init__(self, *, model: str, include_usage: bool = False,
+                 completion_id: str | None = None) -> None:
+        self.id = completion_id or new_completion_id()
+        self.created = int(time.time())
+        self.model = model
+        self.include_usage = include_usage
+        self._messages = 0
+
+    def _chunk(self, delta: dict[str, Any] | None, finish_reason: str | None = None,
+               **extra: Any) -> dict[str, Any]:
+        chunk = {
+            "id": self.id, "object": "chat.completion.chunk", "created": self.created,
+            "model": self.model, "system_fingerprint": None,
+            "choices": [] if delta is None else [{
+                "index": 0, "delta": delta, "finish_reason": finish_reason, "logprobs": None,
+            }],
+            **extra,
+        }
+        if self.include_usage and "usage" not in extra:
+            chunk["usage"] = None  # as OpenAI does on every chunk but the last
+        return chunk
+
+    def feed(self, ev: dict[str, Any]) -> list[dict[str, Any]]:
+        kind = ev["type"]
+        if kind == "response.created":
+            return [self._chunk({"role": "assistant", "content": "", "refusal": None})]
+        if kind == "response.output_item.added" and ev["item"]["type"] == "message":
+            self._messages += 1
+            if self._messages > 1:
+                return [self._chunk({"content": "\n\n"})]
+        elif kind == "response.output_text.delta":
+            return [self._chunk({"content": ev["delta"]})]
+        elif kind in ("response.completed", "response.incomplete"):
+            out = [self._chunk({}, finish_reason="stop")]
+            if self.include_usage:
+                out.append(self._chunk(None, usage=chat_usage(ev["response"]["usage"])))
+            return out
+        return []
+
+
+def encode_chat_sse(payload: dict[str, Any] | str) -> str:
+    """Chat Completions frames carry no `event:` line; the stream ends with [DONE]."""
+    data = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    return f"data: {data}\n\n"

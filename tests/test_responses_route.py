@@ -22,6 +22,7 @@ from conduix.backend import (
     TurnDone,
     TurnError,
     UnknownModelError,
+    UnsupportedEffortError,
     Usage,
 )
 from conduix.responses_store import ResponseStore
@@ -47,6 +48,8 @@ class FakeBackend:
     def resolve_model(self, model, effort=None):
         if model == "nope":
             raise UnknownModelError("unknown model")
+        if effort == "bogus":
+            raise UnsupportedEffortError("effort 'bogus' is not supported")
         return model
 
     def model_name(self, model):

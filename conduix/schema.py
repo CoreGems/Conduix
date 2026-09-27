@@ -74,7 +74,7 @@ def _texts(content: Any) -> list[str]:
             out.append(part.get("text", ""))
         elif kind == "refusal":
             out.append(part.get("refusal", ""))
-        elif kind == "input_image":
+        elif kind in ("input_image", "image_url"):
             raise _bad("image input is not supported yet")
         else:
             raise _bad(f"content part type {kind!r} is not supported")

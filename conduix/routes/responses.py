@@ -129,7 +129,7 @@ async def _turn(
         sess.head_response_id = rs.id
 
 
-async def _events(p: Plan, rs: ResponseStream) -> AsyncIterator[Event]:
+async def run_events(p: Plan, rs: ResponseStream) -> AsyncIterator[Event]:
     req = p.req
     own = [m.to_item() for m in p.history]
 
@@ -200,7 +200,7 @@ async def create_response(req: ResponseCreateRequest):
         text=req.text,
         session_id=req.session_id,
     )
-    events = _events(p, rs)
+    events = run_events(p, rs)
     if req.stream:
         return StreamingResponse(
             _sse(rs, events), media_type="text/event-stream",

@@ -339,7 +339,7 @@ passes.
    `previous_response_id`.
 8. ✅ **Errors** (done 2026-09-27; `/v1/models` added too): quota/auth/upstream mapping. Streaming failures are sent as SSE
    `error` events, never as a dropped connection (Conduit commit `a7ce494`).
-9. **`/v1/chat/completions`** as a translation layer over 6–7.
+9. ✅ **`/v1/chat/completions`** (done 2026-09-27) as a translation layer over 6–7. v1 acceptance (§6) passes live.
 10. **Images** (data URL passthrough).
 11. **Tests**: offline unit tests against a fake app-server; integration tests
     through the `openai` SDK (`client = OpenAI(base_url="http://127.0.0.1:8766/v1", api_key="x")`).
