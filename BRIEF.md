@@ -231,10 +231,19 @@ Thread state is enough for sessions.
 the custom `base_instructions`. From the second turn on, about 4.2k of that is
 cached. Report it honestly in `usage` and investigate in §7.
 
-**Reasoning summaries were empty.** With `summary="auto"` and
-`effort="low"`, the `reasoning` item arrived with `summary: []`. Retry at
-higher effort and with `summary="detailed"` before promising summaries in
-v1.
+**Reasoning summaries arrive only when the model actually reasons.** With
+`summary="auto"` at `effort="low"` the `reasoning` item came back with
+`summary: []`, and an easy question at medium/high used 0 reasoning tokens
+and produced no reasoning item at all. A hard problem at `xhigh` with
+`summary="detailed"` (2026-09-27) produced 66 reasoning items, 108
+`item/reasoning/summaryTextDelta` events and ~34k reasoning tokens in one
+turn: summaries work, but many small reasoning items per turn is normal.
+
+**History injection.** `thread/inject_items` (raw request; the SDK has no
+wrapper) appends raw Responses API items (`message` with user / assistant /
+developer roles) to a thread's model-visible history. Checked live: an
+injected assistant turn was recalled. Stateless replay and
+`previous_response_id` rebuilds use it instead of flattening history to text.
 
 ---
 
@@ -247,12 +256,12 @@ v1.
 | Stateful sessions (`session_id`, `previous_response_id`) | ✅ | One Codex thread per session, with a per-session `asyncio.Lock` |
 | Image input (`input_image`, `image_url`)  | ✅ | Data URLs go through as `ImageInput`. Remote URLs get a 400 (deprecated upstream). All listed models take image input. |
 | `reasoning.effort`                        | ✅ | Passed through and validated against the model's supported efforts (§3.1) |
-| Reasoning summaries                       | ⚠️ | As `reasoning` output items (Responses API). The probe returned an empty `summary` at low effort, so this is unconfirmed (§3.1) |
+| Reasoning summaries                       | ✅ | As `reasoning` output items (Responses API). Only when the model reasons; empty at low effort (§3.1) |
 | Usage (`input_tokens`, `output_tokens`, `reasoning_tokens`, cached) | ✅ | Taken from `thread/tokenUsage/updated` → `token_usage.last`. Every OpenAI usage field has a direct source (§3.1). |
 | Custom function tools (client-executed)   | 🟡 v1.1 | Pause/resume as in Conduit's `TOOLS_HOWTO.md`: park the turn, emit `function_call`, resume on `function_call_output` |
 | Hosted `web_search`                       | 🟡 v1.1 | Codex has its own web search, which is turned on per request |
 | `temperature`, `top_p`, `stop`, `max_output_tokens` | ⚠️ | Accepted. Applied where Codex supports them, otherwise ignored, and the docs list which |
-| Structured outputs (`text.format` json_schema) | ⚠️ | Codex has an output-schema option. Check whether it can be reached through app-server |
+| Structured outputs (`text.format` json_schema) | ✅ | Passed as the turn's `output_schema`; verified live 2026-09-27. `json_object` returns 400 |
 
 ---
 
@@ -326,7 +335,7 @@ passes.
 5. ✅ **Sessions** (done 2026-09-27; `/v1/sessions` routes and a minimal `errors.py` included): thread per session, locks, eviction.
 6. ✅ **Streaming, Responses API** (done 2026-09-27): the SSE synthesizer and its non-streaming
    collector.
-7. **`/v1/responses` route**: stateless replay, `session_id`, and
+7. ✅ **`/v1/responses` route** (done 2026-09-27): stateless replay, `session_id`, and
    `previous_response_id`.
 8. **Errors**: quota/auth/upstream mapping. Streaming failures are sent as SSE
    `error` events, never as a dropped connection (Conduit commit `a7ce494`).

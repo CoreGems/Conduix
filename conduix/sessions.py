@@ -45,6 +45,12 @@ class Session:
     last_used_at: float = field(default_factory=time.time)
     turn_count: int = 0
     closed: bool = False
+    # Created by /v1/responses for a request without session_id; hidden from
+    # GET /v1/sessions but swept and capped like any other session.
+    implicit: bool = False
+    # Last completed response on this thread; None once the thread holds a
+    # turn that no stored response describes (failed turn, store=false).
+    head_response_id: str | None = None
 
     @property
     def busy(self) -> bool:
@@ -83,6 +89,7 @@ class SessionManager:
         model: str | None = None,
         effort: str | None = None,
         instructions: str | None = None,
+        implicit: bool = False,
     ) -> Session:
         model = backend.resolve_model(model, effort)
         thread = await backend.start_thread(model=model, developer_instructions=instructions)
@@ -103,7 +110,7 @@ class SessionManager:
 
         sess = Session(
             id=f"sess_{uuid.uuid4().hex}", thread=thread,
-            model=model, effort=effort, instructions=instructions,
+            model=model, effort=effort, instructions=instructions, implicit=implicit,
         )
         self._sessions[sess.id] = sess
         return sess
@@ -111,8 +118,8 @@ class SessionManager:
     def get(self, sid: str) -> Session | None:
         return self._sessions.get(sid)
 
-    def list(self) -> list[Session]:
-        return list(self._sessions.values())
+    def list(self, *, include_implicit: bool = True) -> list[Session]:
+        return [s for s in self._sessions.values() if include_implicit or not s.implicit]
 
     async def delete(self, sid: str) -> bool:
         sess = self._sessions.get(sid)

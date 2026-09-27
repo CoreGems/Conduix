@@ -76,6 +76,8 @@ class ResponseStream:
         previous_response_id: str | None = None,
         reasoning: dict[str, Any] | None = None,
         metadata: dict[str, str] | None = None,
+        text: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> None:
         self.id = response_id or new_response_id()
         self.response: dict[str, Any] = {
@@ -94,12 +96,14 @@ class ResponseStream:
             "previous_response_id": previous_response_id,
             "reasoning": reasoning or {"effort": None, "summary": None},
             "temperature": None,
-            "text": {"format": {"type": "text"}},
+            "text": text or {"format": {"type": "text"}},
             "tool_choice": "auto",
             "tools": [],
             "top_p": None,
             "usage": None,
         }
+        if session_id is not None:
+            self.response["session_id"] = session_id  # Conduix extension
         self._seq = 0
         self._items: dict[str, _Message | _Reasoning] = {}
         self._error: TurnError | None = None
@@ -229,6 +233,12 @@ class ResponseStream:
             self._emit("response.created", response=self._snapshot()),
             self._emit("response.in_progress", response=self._snapshot()),
         ]
+
+    def error_event(self, message: str, *, code: str | None = None,
+                    param: str | None = None) -> dict:
+        """A terminal `error` event for failures outside the turn itself."""
+        self.finished = True
+        return self._emit("error", code=code, message=message, param=param)
 
     def feed(self, ev: Event) -> list[dict]:
         if self.finished:

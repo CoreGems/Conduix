@@ -44,7 +44,7 @@ class SessionList(BaseModel):
 
 @router.get("", response_model=SessionList)
 async def list_sessions() -> SessionList:
-    return SessionList(data=[SessionInfo.of(s) for s in manager.list()])
+    return SessionList(data=[SessionInfo.of(s) for s in manager.list(include_implicit=False)])
 
 
 @router.post("", response_model=SessionInfo)

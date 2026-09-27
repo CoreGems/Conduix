@@ -11,6 +11,7 @@ from conduix import __version__
 from conduix import errors
 from conduix.backend import backend
 from conduix.config import settings
+from conduix.routes.responses import router as responses_router
 from conduix.routes.sessions import router as sessions_router
 from conduix.sessions import manager
 
@@ -36,6 +37,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 errors.install(app)
+app.include_router(responses_router)
 app.include_router(sessions_router)
 
 

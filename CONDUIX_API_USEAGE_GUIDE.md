@@ -297,8 +297,10 @@ of your plan quota used.
 
 **Reasoning summaries.** You can ask for them with
 `reasoning={"effort": "high", "summary": "auto"}`. They come back as
-`reasoning` items in `output`. This is **not guaranteed**: at low effort the
-summary came back empty in testing. Chat Completions never returns reasoning.
+`reasoning` items in `output`. They only appear when the model actually
+reasons: at low effort, or on an easy question, there may be none. A hard
+problem at high effort can produce dozens of short reasoning items. Chat
+Completions never returns reasoning.
 
 ---
 
@@ -353,8 +355,8 @@ r = client.responses.create(
 )
 ```
 
-This is planned for v1 through Codex's `output_schema` and has not been
-verified yet.
+`r.output_text` is then a JSON string matching the schema. Only
+`json_schema` is supported; `{"type": "json_object"}` returns 400.
 
 ---
 

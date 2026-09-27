@@ -233,6 +233,7 @@ class Backend:
         self.plan_type: str | None = None
         self.codex_version: str | None = None
         self._models: list[dict[str, Any]] = []
+        self._bg: set[asyncio.Task] = set()
 
     @property
     def started(self) -> bool:
@@ -332,11 +333,33 @@ class Backend:
             )
         return model
 
+    def model_name(self, model: str | None) -> str:
+        """The id to report for `model` (None → the plan's default model)."""
+        model = model or settings().default_model
+        if model:
+            return model
+        return next((m["id"] for m in self._models if m["is_default"]), "codex-default")
+
+    async def inject_items(self, thread: AsyncThread, items: list[dict[str, Any]]) -> None:
+        """Append Responses API items to a thread's model-visible history.
+
+        Used to replay conversation history as real user/assistant messages.
+        Raw `thread/inject_items` request: the SDK has no wrapper for it.
+        """
+        if not items:
+            return
+        from openai_codex.generated.v2_all import ThreadInjectItemsResponse
+
+        await self.codex._client.request(
+            "thread/inject_items", {"threadId": thread.id, "items": items},
+            response_model=ThreadInjectItemsResponse,
+        )
+
     async def close_thread(self, thread_id: str) -> None:
         """Unload a thread from app-server. Best effort.
 
         The SDK has no wrapper for `thread/unsubscribe`, so this goes through
-        its raw typed request; the one private-API use in Conduix.
+        its raw typed request (as does inject_items).
         """
         if self._codex is None:
             return
@@ -377,6 +400,7 @@ class Backend:
         model: str | None = None,
         effort: str | None = None,
         summary: str | None = None,
+        output_schema: dict[str, Any] | None = None,
     ) -> AsyncIterator[Event]:
         """Run one turn and yield its events, ending with TurnDone.
 
@@ -384,7 +408,8 @@ class Backend:
         interrupted so Codex doesn't keep spending plan quota.
         """
         handle = await thread.turn(
-            input, model=model, effort=effort or settings().default_effort, summary=summary
+            input, model=model, effort=effort or settings().default_effort, summary=summary,
+            output_schema=output_schema,
         )
         done = False
         try:
@@ -394,10 +419,19 @@ class Backend:
                     yield ev
         finally:
             if not done:
-                try:
-                    await asyncio.wait_for(handle.interrupt(), timeout=5)
-                except Exception as e:  # noqa: BLE001 - best effort
-                    log.warning("could not interrupt turn %s: %s", handle.id, e)
+                # A separate task: on client disconnect Starlette cancels via
+                # an anyio cancel scope, which would cancel an await here too.
+                task = asyncio.get_running_loop().create_task(self._interrupt(handle))
+                self._bg.add(task)
+                task.add_done_callback(self._bg.discard)
+
+    @staticmethod
+    async def _interrupt(handle: Any) -> None:
+        try:
+            await asyncio.wait_for(handle.interrupt(), timeout=5)
+            log.info("interrupted turn %s (consumer went away)", handle.id)
+        except Exception as e:  # noqa: BLE001 - best effort
+            log.warning("could not interrupt turn %s: %s", handle.id, e)
 
 
 backend = Backend()
