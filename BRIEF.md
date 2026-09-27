@@ -324,7 +324,7 @@ passes.
    to a small internal event type.
 4. **Schema + config**.
 5. ✅ **Sessions** (done 2026-09-27; `/v1/sessions` routes and a minimal `errors.py` included): thread per session, locks, eviction.
-6. **Streaming, Responses API**: the SSE synthesizer and its non-streaming
+6. ✅ **Streaming, Responses API** (done 2026-09-27): the SSE synthesizer and its non-streaming
    collector.
 7. **`/v1/responses` route**: stateless replay, `session_id`, and
    `previous_response_id`.

@@ -91,3 +91,32 @@ async def test_session_remembers_and_closes(be, monkeypatch, caplog):
     assert await mgr.delete(sess.id)
     await asyncio.gather(*list(mgr._closing))
     assert "could not unsubscribe" not in caplog.text
+
+
+async def test_live_turn_through_response_stream(be):
+    import httpx
+    from openai import OpenAI
+    from openai.types.responses import Response, ResponseStreamEvent
+    from pydantic import TypeAdapter
+
+    from conduix.streaming import ResponseStream, encode_sse, stream_response
+
+    thread = await be.start_thread()
+    rs = ResponseStream(model="gpt-6-astra")
+    out = [e async for e in stream_response(
+        rs, be.run_turn(thread, "Count from 1 to 5, comma-separated.", effort="low"))]
+
+    adapter = TypeAdapter(ResponseStreamEvent)
+    for e in out:
+        adapter.validate_python(e)
+    assert out[-1]["type"] == "response.completed"
+    final = Response.model_validate(rs.response)
+    assert "1" in final.output_text and "5" in final.output_text
+    assert final.usage.input_tokens > 0
+
+    body = "".join(encode_sse(e) for e in out)
+    client = OpenAI(base_url="http://conduix.test/v1", api_key="x", http_client=httpx.Client(
+        transport=httpx.MockTransport(lambda _r: httpx.Response(
+            200, text=body, headers={"content-type": "text/event-stream"}))))
+    with client.responses.stream(model="gpt-6-astra", input="x") as s:
+        assert s.get_final_response().output_text == final.output_text

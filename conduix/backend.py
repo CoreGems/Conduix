@@ -120,6 +120,7 @@ class Usage:
     cached_input_tokens: int
     output_tokens: int
     reasoning_output_tokens: int
+    cache_write_input_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +191,7 @@ def map_notification(method: str, payload: dict[str, Any]) -> list[Event]:
             cached_input_tokens=last.get("cached_input_tokens", 0),
             output_tokens=last.get("output_tokens", 0),
             reasoning_output_tokens=last.get("reasoning_output_tokens", 0),
+            cache_write_input_tokens=last.get("cache_write_input_tokens") or 0,
         )]
 
     if method == "error":

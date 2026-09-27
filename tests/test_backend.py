@@ -55,14 +55,15 @@ def test_usage_uses_last_not_total():
     payload = {
         "token_usage": {
             "last": {"input_tokens": 4418, "cached_input_tokens": 4200, "output_tokens": 9,
-                     "reasoning_output_tokens": 2, "total_tokens": 4427},
+                     "reasoning_output_tokens": 2, "total_tokens": 4427,
+                     "cache_write_input_tokens": 118},
             "total": {"input_tokens": 9999, "cached_input_tokens": 0, "output_tokens": 99,
                       "reasoning_output_tokens": 0, "total_tokens": 10098},
             "model_context_window": 258400,
         },
         **TID,
     }
-    assert map_notification("thread/tokenUsage/updated", payload) == [Usage(4418, 4200, 9, 2)]
+    assert map_notification("thread/tokenUsage/updated", payload) == [Usage(4418, 4200, 9, 2, 118)]
 
 
 def test_turn_completed():
