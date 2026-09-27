@@ -51,18 +51,47 @@ class ChatCompletionRequest(BaseModel):
     n: int | None = None
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any = None
+    web_search_options: dict[str, Any] | None = None
 
 
 def _input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Chat messages as Responses input items (content shapes are shared)."""
+    """Chat messages as Responses input items (content shapes are shared).
+
+    An assistant message's `tool_calls` become function_call items and `tool`
+    messages become function_call_output items.
+    """
     items = []
     for m in messages:
         role = m.get("role")
-        if role == "tool" or m.get("tool_calls") or m.get("function_call"):
-            raise APIError(400, "function tools are not supported yet (planned for v1.1)",
+        if role == "function" or m.get("function_call"):
+            raise APIError(400, "legacy function_call messages are not supported; use tools",
                            param="messages")
-        items.append({"role": role, "content": m.get("content") or ""})
+        if role == "tool":
+            items.append({"type": "function_call_output", "call_id": m.get("tool_call_id"),
+                          "output": m.get("content") or ""})
+            continue
+        if role != "assistant" or m.get("content") or not m.get("tool_calls"):
+            items.append({"role": role, "content": m.get("content") or ""})
+        for call in m.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            items.append({"type": "function_call", "call_id": call.get("id"),
+                          "name": fn.get("name"), "arguments": fn.get("arguments") or ""})
     return items
+
+
+def _tools(req: "ChatCompletionRequest") -> list[dict[str, Any]] | None:
+    """Chat `tools` (and `web_search_options`) as Responses tools."""
+    tools = []
+    for i, t in enumerate(req.tools or []):
+        if t.get("type") != "function":
+            raise APIError(400, f"tool type {t.get('type')!r} is not supported; use function",
+                           param=f"tools[{i}].type")
+        fn = t.get("function") or {}
+        tools.append({"type": "function", "name": fn.get("name"),
+                      "description": fn.get("description"), "parameters": fn.get("parameters")})
+    if req.web_search_options is not None:
+        tools.append({"type": "web_search"})
+    return tools or None
 
 
 def _text(response_format: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -78,10 +107,9 @@ def _text(response_format: dict[str, Any] | None) -> dict[str, Any] | None:
 def to_responses_request(req: ChatCompletionRequest) -> ResponseCreateRequest:
     if req.n not in (None, 1):
         raise APIError(400, "only n=1 is supported", param="n")
-    if req.tools:
-        raise APIError(400, "function tools are not supported yet (planned for v1.1)",
-                       param="tools")
     return ResponseCreateRequest(
+        tools=_tools(req),
+        tool_choice=req.tool_choice,
         model=req.model,
         input=_input(req.messages),
         stream=req.stream,

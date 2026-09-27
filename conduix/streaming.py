@@ -38,9 +38,11 @@ from conduix.backend import (
     ReasoningStarted,
     ReasoningSummaryDelta,
     TextDelta,
+    ToolCall,
     TurnDone,
     TurnError,
     Usage,
+    WebSearchCall,
 )
 
 from conduix.errors import resolve
@@ -58,6 +60,13 @@ class _Message:
     id: str
     phase: str | None
     text: str = ""
+    done: bool = False
+
+
+@dataclass
+class _WebSearch:
+    index: int
+    id: str
     done: bool = False
 
 
@@ -108,7 +117,8 @@ class ResponseStream:
         if session_id is not None:
             self.response["session_id"] = session_id  # Conduix extension
         self._seq = 0
-        self._items: dict[str, _Message | _Reasoning] = {}
+        self._items: dict[str, _Message | _Reasoning | _WebSearch] = {}
+        self.tool_calls: list[dict[str, Any]] = []  # function_call items, in order
         self._error: TurnError | None = None
         self.failure: TurnError | None = None  # set when the turn failed
         self.finished = False
@@ -230,6 +240,52 @@ class ResponseStream:
                               item=copy.deepcopy(item)))
         return out
 
+    def _function_call(self, ev: ToolCall) -> list[dict]:
+        item = {"id": f"fc_{uuid.uuid4().hex}", "type": "function_call", "status": "completed",
+                "call_id": ev.call_id, "name": ev.name, "arguments": ev.arguments}
+        index = self._add_item(item)
+        self.tool_calls.append(item)
+        started = {**item, "status": "in_progress", "arguments": ""}
+        return [
+            self._emit("response.output_item.added", output_index=index, item=started),
+            self._emit("response.function_call_arguments.delta", item_id=item["id"],
+                       output_index=index, delta=ev.arguments),
+            self._emit("response.function_call_arguments.done", item_id=item["id"],
+                       output_index=index, arguments=ev.arguments),
+            self._emit("response.output_item.done", output_index=index, item=copy.deepcopy(item)),
+        ]
+
+    def _web_search(self, ev: WebSearchCall) -> list[dict]:
+        ws = self._items.get(ev.item_id)
+        if not isinstance(ws, _WebSearch):
+            ws = _WebSearch(index=len(self.response["output"]), id=ev.item_id)
+            self._items[ws.id] = ws
+            self._add_item({"id": ws.id, "type": "web_search_call", "status": "in_progress",
+                            "action": _web_action(ev.action)})
+            out = [
+                self._emit("response.output_item.added", output_index=ws.index,
+                           item=copy.deepcopy(self.response["output"][ws.index])),
+                self._emit("response.web_search_call.in_progress", item_id=ws.id,
+                           output_index=ws.index),
+                self._emit("response.web_search_call.searching", item_id=ws.id,
+                           output_index=ws.index),
+            ]
+        else:
+            out = []
+        if ev.status == "in_progress":
+            return out
+        ws.done = True
+        item = self.response["output"][ws.index]
+        item["status"] = ev.status
+        if ev.action:
+            item["action"] = _web_action(ev.action)
+        if ev.status == "completed":
+            out.append(self._emit("response.web_search_call.completed", item_id=ws.id,
+                                  output_index=ws.index))
+        out.append(self._emit("response.output_item.done", output_index=ws.index,
+                              item=copy.deepcopy(item)))
+        return out
+
     # --- public --------------------------------------------------------------
 
     def start(self) -> list[dict]:
@@ -278,6 +334,12 @@ class ResponseStream:
                 out = self._start_reasoning(ReasoningStarted(ev.item_id))
             return out + self._finish_reasoning(self._items[ev.item_id], ev.summary)
 
+        if isinstance(ev, ToolCall):
+            return self._function_call(ev)
+
+        if isinstance(ev, WebSearchCall):
+            return self._web_search(ev)
+
         if isinstance(ev, Usage):
             self.response["usage"] = {
                 "input_tokens": ev.input_tokens,
@@ -308,6 +370,8 @@ class ResponseStream:
                 continue
             if isinstance(item, _Message):
                 out += self._finish_message(item, None, "incomplete")
+            elif isinstance(item, _WebSearch):
+                out += self._web_search(WebSearchCall(item.id, "incomplete"))
             else:
                 out += self._finish_reasoning(item, None)
 
@@ -337,6 +401,17 @@ class ResponseStream:
             self._emit("error", code=kind.code, message=message, param=param),
             self._emit("response.failed", response=self._snapshot()),
         ]
+
+
+def _web_action(action: dict[str, Any]) -> dict[str, Any]:
+    """Codex webSearch action → OpenAI web_search_call action."""
+    kind = action.get("type")
+    if kind == "openPage":
+        return {"type": "open_page", "url": action.get("url")}
+    if kind == "findInPage":
+        return {"type": "find_in_page", "url": action.get("url") or "",
+                "pattern": action.get("pattern") or ""}
+    return {"type": "search", "query": action.get("query") or ""}
 
 
 def _text_part(text: str) -> dict[str, Any]:
@@ -408,8 +483,19 @@ def _message_texts(response: dict[str, Any]) -> list[str]:
     ]
 
 
+def _chat_tool_call(item: dict[str, Any]) -> dict[str, Any]:
+    return {"id": item["call_id"], "type": "function",
+            "function": {"name": item["name"], "arguments": item["arguments"]}}
+
+
 def chat_completion(response: dict[str, Any], *, completion_id: str | None = None) -> dict[str, Any]:
     """Non-streaming: a finished Responses `response` as a `chat.completion`."""
+    calls = [_chat_tool_call(item) for item in response["output"] if item["type"] == "function_call"]
+    texts = _message_texts(response)
+    message = {"role": "assistant", "content": "\n\n".join(texts) if texts or not calls else None,
+               "refusal": None, "annotations": []}
+    if calls:
+        message["tool_calls"] = calls
     out = {
         "id": completion_id or new_completion_id(),
         "object": "chat.completion",
@@ -417,9 +503,8 @@ def chat_completion(response: dict[str, Any], *, completion_id: str | None = Non
         "model": response["model"],
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": "\n\n".join(_message_texts(response)),
-                        "refusal": None, "annotations": []},
-            "finish_reason": "stop",
+            "message": message,
+            "finish_reason": "tool_calls" if calls else "stop",
             "logprobs": None,
         }],
         "usage": chat_usage(response["usage"]),
@@ -444,6 +529,7 @@ class ChatStream:
         self.model = model
         self.include_usage = include_usage
         self._messages = 0
+        self._tool_calls: dict[str, int] = {}  # function_call item id → tool_calls index
 
     def _chunk(self, delta: dict[str, Any] | None, finish_reason: str | None = None,
                **extra: Any) -> dict[str, Any]:
@@ -467,10 +553,22 @@ class ChatStream:
             self._messages += 1
             if self._messages > 1:
                 return [self._chunk({"content": "\n\n"})]
+        elif kind == "response.output_item.added" and ev["item"]["type"] == "function_call":
+            item = ev["item"]
+            index = self._tool_calls[item["id"]] = len(self._tool_calls)
+            return [self._chunk({"tool_calls": [{
+                "index": index, "id": item["call_id"], "type": "function",
+                "function": {"name": item["name"], "arguments": ""},
+            }]})]
+        elif kind == "response.function_call_arguments.delta":
+            return [self._chunk({"tool_calls": [{
+                "index": self._tool_calls[ev["item_id"]], "function": {"arguments": ev["delta"]},
+            }]})]
         elif kind == "response.output_text.delta":
             return [self._chunk({"content": ev["delta"]})]
         elif kind in ("response.completed", "response.incomplete"):
-            out = [self._chunk({}, finish_reason="stop")]
+            reason = "tool_calls" if self._tool_calls else "stop"
+            out = [self._chunk({}, finish_reason=reason)]
             if self.include_usage:
                 out.append(self._chunk(None, usage=chat_usage(ev["response"]["usage"])))
             return out

@@ -18,9 +18,9 @@ which does the same for a Claude Max plan behind an Anthropic-compatible
 
 > **Status: v1 built.** Responses and Chat Completions (streaming and not),
 > multi-turn via history, `previous_response_id` or sessions, images,
-> structured output, and OpenAI-shaped errors all work against a live ChatGPT
-> plan. Function tools and web search are planned for v1.1. See
-> [`BRIEF.md`](./BRIEF.md) §6 for the build log.
+> structured output, function tools, web search and OpenAI-shaped errors all
+> work against a live ChatGPT plan. See [`BRIEF.md`](./BRIEF.md) §6 for the
+> build log.
 
 ## Usage
 
@@ -135,6 +135,7 @@ behaves like a plain model endpoint, not a coding agent.
   expose it to a network.
 - **Counts against your plan limits.** Each turn carries about 4.4k tokens of
   fixed Codex prompt overhead, which is mostly cached after the first turn.
-- **v1 is chat only.** Function tools and web search are planned for v1.1.
+- **No shell, no files.** Codex's own agent tools stay off; the model can
+  only call the functions you declare, and search the web when you ask for it.
 - Codex's app-server protocol is marked experimental upstream, so pin the SDK
   version and upgrade deliberately.

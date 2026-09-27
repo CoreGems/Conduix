@@ -145,3 +145,39 @@ def test_tool_bait_has_no_effect(client):
     assert r.status == "completed"
     assert not (Path(settings().workspace_dir) / "pwned.txt").exists()
     assert health()["blocked_agent_items"] == before  # Codex never even started a tool item
+
+
+WEATHER = {"type": "function", "name": "get_weather", "description": "Current weather for a city.",
+           "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                          "required": ["city"], "additionalProperties": False}}
+
+
+def test_function_tool_round_trip(client):
+    r1 = client.responses.create(model=M, reasoning=LOW, tools=[WEATHER],
+                                 input="What's the weather in Kyiv right now? Use the tool.")
+    [call] = [o for o in r1.output if o.type == "function_call"]
+    assert call.name == "get_weather" and json.loads(call.arguments)["city"].lower() == "kyiv"
+    r2 = client.responses.create(model=M, reasoning=LOW, tools=[WEATHER], previous_response_id=r1.id,
+                                 input=[{"type": "function_call_output", "call_id": call.call_id,
+                                         "output": '{"temp_c": 17, "sky": "cloudy"}'}])
+    assert "17" in r2.output_text
+
+
+def test_chat_tool_round_trip(client):
+    tool = {"type": "function", "function": {k: v for k, v in WEATHER.items() if k != "type"}}
+    msgs = [{"role": "user", "content": "What's the weather in Oslo? Use the tool."}]
+    ch = client.chat.completions.create(model=M, reasoning_effort="low", tools=[tool],
+                                        messages=msgs).choices[0]
+    assert ch.finish_reason == "tool_calls"
+    msgs += [ch.message.model_dump(exclude_none=True)] + [
+        {"role": "tool", "tool_call_id": tc.id, "content": '{"temp_c": -3, "sky": "snow"}'}
+        for tc in ch.message.tool_calls]
+    answer = client.chat.completions.create(model=M, reasoning_effort="low", tools=[tool],
+                                            messages=msgs).choices[0].message.content
+    assert "3" in answer or "snow" in answer.lower()
+
+
+def test_web_search(client):
+    r = client.responses.create(model=M, reasoning=LOW, tools=[{"type": "web_search"}], input=(
+        "Search the web: what is the latest stable Python 3 release? One sentence with the version."))
+    assert "web_search_call" in [o.type for o in r.output] and "3." in r.output_text

@@ -19,15 +19,26 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator
 from contextlib import aclosing
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
-from conduix.backend import Event, backend
+from conduix.backend import Event, ToolCall, TurnDone, backend
 from conduix.errors import APIError, from_exception, from_turn_error, not_found
 from conduix.responses_store import StoredResponse, store
-from conduix.schema import Msg, ResponseCreateRequest, parse_input, split_turn
+from conduix.schema import (
+    FunctionCall,
+    FunctionOutput,
+    Item,
+    Msg,
+    ResponseCreateRequest,
+    check_tool_outputs,
+    parse_input,
+    parse_tools,
+    split_turn,
+)
 from conduix.sessions import Session, manager
 from conduix.streaming import ResponseStream, collect_response, encode_sse, stream_response
 
@@ -43,9 +54,25 @@ class Plan:
     effort: str | None
     summary: str | None
     output_schema: dict[str, Any] | None
-    history: list[Msg]  # earlier messages in `input`, to inject
-    new: list[Msg]  # the trailing user message(s): this turn
+    history: list[Item]  # earlier items in `input`, to inject
+    new: list[Msg]  # the trailing user message(s): this turn (may be empty)
     prev: StoredResponse | None
+    tools: list[dict[str, Any]] = field(default_factory=list)  # Codex dynamic tool specs
+    web_search: bool = False
+    tool_called: bool = False  # set when the turn ended on a function call
+
+    @property
+    def tools_key(self) -> str:
+        return json.dumps([self.tools, self.web_search], sort_keys=True) if (
+            self.tools or self.web_search) else ""
+
+
+def _has_images(item: Item) -> bool:
+    if isinstance(item, Msg):
+        return item.has_images
+    if isinstance(item, FunctionOutput) and isinstance(item.output, list):
+        return any(p.get("type") == "input_image" for p in item.output)
+    return False
 
 
 def _output_schema(text: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -63,9 +90,12 @@ def _output_schema(text: dict[str, Any] | None) -> dict[str, Any] | None:
 
 def plan(req: ResponseCreateRequest) -> Plan:
     """Validate the request. Every 4xx is raised here, before any streaming."""
-    if req.tools:
-        raise APIError(400, "function tools are not supported yet (planned for v1.1)",
-                       param="tools")
+    tools, web_search = parse_tools(req.tools, req.tool_choice)
+    if req.session_id and (tools or web_search):
+        # A tool call ends the turn and needs a fresh thread to resume on,
+        # which a long-lived session thread can't give.
+        raise APIError(400, "tools can't be combined with session_id; use previous_response_id "
+                       "or resend the history", param="tools")
     if req.session_id and req.previous_response_id:
         raise APIError(400, "use either session_id or previous_response_id, not both",
                        param="previous_response_id")
@@ -75,7 +105,7 @@ def plan(req: ResponseCreateRequest) -> Plan:
     model = backend.resolve_model(req.model, effort)
     msgs = parse_input(req.input)
     history, new = split_turn(msgs)
-    if any(m.has_images for m in msgs) and not backend.supports_images(model):
+    if any(_has_images(m) for m in msgs) and not backend.supports_images(model):
         raise APIError(400, f"model {backend.model_name(model)!r} does not accept image input",
                        param="model", code="unsupported_value")
 
@@ -95,14 +125,21 @@ def plan(req: ResponseCreateRequest) -> Plan:
                 "restarted); resend the conversation history instead",
                 param="previous_response_id",
             )
-    return Plan(req, model, effort, summary, _output_schema(req.text), history, new, prev)
+    check_tool_outputs(msgs, store.history(prev.id) if prev else [])
+    return Plan(req, model, effort, summary, _output_schema(req.text), history, new, prev,
+                tools=tools, web_search=web_search)
 
 
-def _assistant_items(rs: ResponseStream) -> list[dict[str, Any]]:
-    return [
-        Msg("assistant", [c["text"] for c in item["content"] if c["type"] == "output_text"]).to_item()
-        for item in rs.response["output"] if item["type"] == "message"
-    ]
+def _output_items(rs: ResponseStream) -> list[dict[str, Any]]:
+    """The response's output as replayable history (messages and function calls)."""
+    out = []
+    for item in rs.response["output"]:
+        if item["type"] == "message":
+            texts = [c["text"] for c in item["content"] if c["type"] == "output_text"]
+            out.append(Msg("assistant", texts).to_item())
+        elif item["type"] == "function_call":
+            out.append(FunctionCall(item["call_id"], item["name"], item["arguments"]).to_item())
+    return out
 
 
 async def _turn(
@@ -116,19 +153,29 @@ async def _turn(
     turn_input = [part for m in p.new for part in m.parts]
     async with aclosing(backend.run_turn(
         sess.thread, turn_input, model=p.model, effort=p.effort,
-        summary=p.summary, output_schema=p.output_schema,
+        summary=p.summary, output_schema=p.output_schema, allow_web_search=p.web_search,
     )) as events:
         async for ev in events:
             yield ev
+            if isinstance(ev, ToolCall):
+                # Hand the call to the client. Leaving the loop closes
+                # run_turn, which interrupts the turn (Codex never gets a
+                # result); the output comes back in a later request and is
+                # replayed onto a fresh thread.
+                p.tool_called = True
+                break
+    if p.tool_called:
+        yield TurnDone("completed")
 
     # The consumer has fed every event to `rs` by the time we resume here.
     if rs.response["status"] == "completed" and p.req.store:
         store.add(StoredResponse(
             id=rs.id, session_id=sess.id, parent_id=parent_id,
-            items=own + [m.to_item() for m in p.new] + _assistant_items(rs),
+            items=own + [m.to_item() for m in p.new] + _output_items(rs),
             instructions=p.req.instructions,
         ))
-        sess.head_response_id = rs.id
+        if not p.tool_called:  # an interrupted thread can't be continued
+            sess.head_response_id = rs.id
 
 
 async def run_events(p: Plan, rs: ResponseStream) -> AsyncIterator[Event]:
@@ -153,7 +200,7 @@ async def run_events(p: Plan, rs: ResponseStream) -> AsyncIterator[Event]:
         # Only implicit sessions: continuing an explicit one here would add
         # turns to a user's session behind its session_id.
         if (sess is not None and sess.implicit and sess.head_response_id == p.prev.id
-                and sess.instructions == req.instructions):
+                and sess.instructions == req.instructions and sess.tools_key == p.tools_key):
             async with manager.use(sess.id) as sess:
                 if sess.head_response_id == p.prev.id:  # nobody moved it while we waited
                     async with aclosing(_turn(p, rs, sess, base=[], own=own,
@@ -164,7 +211,8 @@ async def run_events(p: Plan, rs: ResponseStream) -> AsyncIterator[Event]:
         log.info("rebuilding history of %s onto a new thread", p.prev.id)
         base = store.history(p.prev.id)
 
-    sess = await manager.create(model=p.model, instructions=req.instructions, implicit=True)
+    sess = await manager.create(model=p.model, instructions=req.instructions, implicit=True,
+                                tools=p.tools, web_search=p.web_search, tools_key=p.tools_key)
     try:
         async with manager.use(sess.id) as sess:
             async with aclosing(_turn(p, rs, sess, base=base, own=own,
@@ -172,7 +220,7 @@ async def run_events(p: Plan, rs: ResponseStream) -> AsyncIterator[Event]:
                 async for ev in events:
                     yield ev
     finally:
-        if not req.store:
+        if not req.store or p.tool_called:
             await manager.delete(sess.id)
 
 

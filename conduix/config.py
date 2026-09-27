@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     default_instructions: str | None = None
 
     codex_bin: str | None = None  # None → the SDK's bundled binary
+    # Codex web_search mode when a request asks for the web_search tool:
+    # "live" (fetch now) or "cached" (Codex's search cache).
+    web_search_mode: str = "live"
     workspace_dir: Path = _default_workspace()
 
     session_idle_timeout_s: int = 30 * 60

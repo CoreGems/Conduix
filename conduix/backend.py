@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 import time
@@ -40,6 +41,23 @@ BASE_INSTRUCTIONS = (
     "You have no tools, no shell and no filesystem. Answer directly."
 )
 
+
+def base_instructions(*, tools: bool = False, web_search: bool = False) -> str:
+    """The chat-only persona, telling the model which tools it really has.
+
+    Found live: with BASE_INSTRUCTIONS ("You have no tools") the model refuses
+    to call declared functions, so a thread with tools needs its own wording.
+    """
+    if not tools and not web_search:
+        return BASE_INSTRUCTIONS
+    parts = ["You are a helpful assistant answering over a chat API. "
+             "You have no shell and no filesystem."]
+    if tools:
+        parts.append("Call the provided functions when they help answer.")
+    if web_search:
+        parts.append("You can search the web; cite the sources you use.")
+    return " ".join(parts)
+
 # Every agentic feature Codex 0.157 turns on by default. Accepted without
 # errors in the step-2 probe (BRIEF.md §3.1).
 CHAT_ONLY_CONFIG: dict[str, Any] = {
@@ -64,12 +82,18 @@ CHAT_ONLY_CONFIG: dict[str, Any] = {
 API_KEY_VARS = ("OPENAI_API_KEY", "CODEX_API_KEY")
 
 # Item types that mean Codex acted as an agent. With CHAT_ONLY_CONFIG they
-# should never appear; if one does, it is logged and dropped.
+# should never appear; if one does, it is logged and dropped. (`webSearch` is
+# allowed only on turns that asked for it; `dynamicToolCall` items mirror the
+# client's own function calls, which arrive as ToolCall events instead.)
 AGENTIC_ITEM_TYPES = frozenset({
-    "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall",
-    "collabAgentToolCall", "subAgentActivity", "webSearch", "imageView",
+    "commandExecution", "fileChange", "mcpToolCall",
+    "collabAgentToolCall", "subAgentActivity", "imageView",
     "imageGeneration", "sleep",
 })
+
+# `item/tool/call` server requests are re-routed into their turn's
+# notification stream under this method (see Backend._reader_loop).
+TOOL_CALL_METHOD = "conduix/toolCall"
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +186,37 @@ def is_quota_error(err: TurnError) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class TokenCount:
+    """Raw `thread/tokenUsage/updated`: `last` model call and thread `total`.
+    run_turn turns these into per-turn Usage (a turn with tool calls makes
+    several model calls, each with its own update)."""
+    last: Usage
+    total: Usage
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    """The model called a client-defined function (`item/tool/call`).
+
+    Codex waits for the result; Conduix never sends one. The consumer ends
+    its response with a function_call item, run_turn interrupts the turn, and
+    the client's output comes back in a later request, replayed onto a fresh
+    thread.
+    """
+    call_id: str
+    name: str
+    arguments: str  # JSON text, as the OpenAI APIs carry it
+    request_id: Any = None
+
+
+@dataclass(frozen=True, slots=True)
+class WebSearchCall:
+    item_id: str
+    status: str  # "in_progress" | "completed"
+    action: dict[str, Any] = field(default_factory=dict)  # {"type": "search", "query"} | ...
+
+
+@dataclass(frozen=True, slots=True)
 class BlockedItem:
     """Codex started an agentic item (shell, file edit, tool call) despite
     chat-only mode. run_turn counts and drops it; it never reaches clients."""
@@ -177,8 +232,24 @@ class TurnDone:
 Event = (
     MessageStarted | TextDelta | MessageDone
     | ReasoningStarted | ReasoningSummaryDelta | ReasoningDone
+    | ToolCall | WebSearchCall
     | Usage | TurnError | TurnDone
 )
+
+
+def _usage(d: dict[str, Any] | None) -> Usage:
+    d = d or {}
+    return Usage(
+        input_tokens=d.get("input_tokens", 0),
+        cached_input_tokens=d.get("cached_input_tokens", 0),
+        output_tokens=d.get("output_tokens", 0),
+        reasoning_output_tokens=d.get("reasoning_output_tokens", 0),
+        cache_write_input_tokens=d.get("cache_write_input_tokens") or 0,
+    )
+
+
+def usage_minus(a: Usage, b: Usage) -> Usage:
+    return Usage(*(max(0, x - y) for x, y in zip(dataclasses.astuple(a), dataclasses.astuple(b))))
 
 
 def _turn_error(err: dict[str, Any]) -> TurnError:
@@ -206,9 +277,21 @@ def map_notification(method: str, payload: dict[str, Any]) -> list[Event]:
             if started:
                 return [ReasoningStarted(item_id)]
             return [ReasoningDone(item_id, list(item.get("summary") or []))]
+        if kind == "webSearch":
+            return [WebSearchCall(item_id, "in_progress" if started else "completed",
+                                  dict(item.get("action") or {}))]
         if kind in AGENTIC_ITEM_TYPES and started:
             return [BlockedItem(kind)]
         return []
+
+    if method == TOOL_CALL_METHOD:
+        args = payload.get("arguments")
+        return [ToolCall(
+            call_id=payload.get("callId", ""),
+            name=payload.get("tool", ""),
+            arguments=args if isinstance(args, str) else json.dumps(args if args is not None else {}),
+            request_id=payload.get("requestId"),
+        )]
 
     if method == "item/agentMessage/delta":
         return [TextDelta(payload.get("item_id", ""), payload.get("delta", ""))]
@@ -221,14 +304,8 @@ def map_notification(method: str, payload: dict[str, Any]) -> list[Event]:
         )]
 
     if method == "thread/tokenUsage/updated":
-        last = (payload.get("token_usage") or {}).get("last") or {}
-        return [Usage(
-            input_tokens=last.get("input_tokens", 0),
-            cached_input_tokens=last.get("cached_input_tokens", 0),
-            output_tokens=last.get("output_tokens", 0),
-            reasoning_output_tokens=last.get("reasoning_output_tokens", 0),
-            cache_write_input_tokens=last.get("cache_write_input_tokens") or 0,
-        )]
+        tu = payload.get("token_usage") or {}
+        return [TokenCount(_usage(tu.get("last")), _usage(tu.get("total") or tu.get("last")))]
 
     if method == "error":
         if payload.get("will_retry"):
@@ -291,6 +368,7 @@ class Backend:
             codex_bin=s.codex_bin, cwd=str(s.workspace_dir),
             launch_args_override=self._launch_args,
         ))
+        self._install_reader_loop(codex)
         await codex.__aenter__()
         try:
             acct = (await codex.account()).account
@@ -315,6 +393,58 @@ class Backend:
         # serverInfo.version is a user-agent string: "0.157.1 (Windows ...) ..."
         self.codex_version = server.version.split()[0] if server and server.version else None
         log.info("codex %s ready: chatgpt plan %r", self.codex_version, self.plan_type)
+
+    def _install_reader_loop(self, codex: AsyncCodex) -> None:
+        """Replace the SDK's stdout reader loop (before the process starts).
+
+        The SDK answers every server-initiated request at once from its single
+        reader thread, and its default answer *accepts* command and file-change
+        approvals. Conduix needs two things it can't do:
+          * decline every approval (defence in depth: approvals are already
+            off, the sandbox read-only and the shell/file tools disabled);
+          * not answer `item/tool/call` at all. It is re-routed into the
+            turn's notification stream (TOOL_CALL_METHOD) so run_turn yields a
+            ToolCall in order with the rest of the turn.
+        Everything else is routed exactly as the SDK's own loop does
+        (openai_codex/client.py, CodexClient._reader_loop, 0.157.1).
+        """
+        sync = codex._client._sync
+
+        def reader_loop() -> None:
+            try:
+                while True:
+                    msg = sync._read_message()
+                    method = msg.get("method")
+                    if method is not None and "id" in msg:
+                        reply = self._server_request(sync, msg)
+                        if reply is not None:
+                            sync._write_message(reply)
+                        continue
+                    if method is not None:
+                        if isinstance(method, str):
+                            sync._router.route_notification(
+                                sync._coerce_notification(method, msg.get("params")))
+                        continue
+                    sync._router.route_response(msg)
+            except BaseException as exc:  # noqa: BLE001 - mirrors the SDK loop
+                sync._router.fail_all(exc)
+
+        sync._reader_loop = reader_loop
+
+    def _server_request(self, sync: Any, msg: dict[str, Any]) -> dict[str, Any] | None:
+        """Answer (or defer) a request from app-server. Runs on the reader thread."""
+        method, rid = msg["method"], msg["id"]
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        if method == "item/tool/call":
+            sync._router.route_notification(sync._coerce_notification(
+                TOOL_CALL_METHOD, {**params, "requestId": rid}))
+            return None  # deferred: never answered, the turn gets interrupted
+        if method.endswith("requestApproval"):
+            self.blocked_items["approval"] = self.blocked_items.get("approval", 0) + 1
+            log.warning("declined codex approval request %s", method)
+            return {"id": rid, "result": {"decision": "decline"}}
+        log.warning("codex sent an unhandled request %s; answered with an error", method)
+        return {"id": rid, "error": {"code": -32601, "message": f"conduix does not handle {method}"}}
 
     async def stop(self) -> None:
         codex, self._codex = self._codex, None
@@ -476,18 +606,47 @@ class Backend:
         model: str | None = None,
         developer_instructions: str | None = None,
         ephemeral: bool = True,
+        tools: list[dict[str, Any]] | None = None,
+        web_search: bool = False,
     ) -> AsyncThread:
+        """Start a chat-only thread.
+
+        `tools` are Codex dynamic tool specs ({type: "function", name,
+        description, inputSchema}); they are fixed for the thread's life.
+        `web_search` turns Codex's own web search back on for this thread.
+        """
         s = settings()
-        return await self.codex.thread_start(
+        config = dict(CHAT_ONLY_CONFIG)
+        if web_search:
+            config["web_search"] = s.web_search_mode
+        kwargs = dict(
             approval_mode=ApprovalMode.deny_all,
             sandbox=Sandbox.read_only,
             cwd=str(s.workspace_dir),
-            base_instructions=BASE_INSTRUCTIONS,
+            base_instructions=base_instructions(tools=bool(tools), web_search=web_search),
             developer_instructions=developer_instructions or s.default_instructions,
             ephemeral=ephemeral,
             model=model or s.default_model,
-            config=CHAT_ONLY_CONFIG,
+            config=config,
         )
+        if not tools:
+            return await self.codex.thread_start(**kwargs)
+
+        # `dynamicTools` is accepted by app-server (verified live) but missing
+        # from the SDK's ThreadStartParams, so build the same params and add it.
+        from openai_codex._approval_mode import _approval_mode_settings
+        from openai_codex._sandbox import _sandbox_mode
+        from openai_codex.generated.v2_all import ThreadStartParams, ThreadStartResponse
+
+        policy, reviewer = _approval_mode_settings(kwargs.pop("approval_mode"))
+        params = ThreadStartParams(
+            approval_policy=policy, approvals_reviewer=reviewer,
+            sandbox=_sandbox_mode(kwargs.pop("sandbox")), **kwargs,
+        ).model_dump(mode="json", by_alias=True, exclude_none=True)
+        params["dynamicTools"] = tools
+        started = await self.codex._client.request(
+            "thread/start", params, response_model=ThreadStartResponse)
+        return AsyncThread(self.codex, started.thread.id)
 
     async def run_turn(
         self,
@@ -498,25 +657,35 @@ class Backend:
         effort: str | None = None,
         summary: str | None = None,
         output_schema: dict[str, Any] | None = None,
+        allow_web_search: bool = False,
     ) -> AsyncIterator[Event]:
         """Run one turn and yield its events, ending with TurnDone.
 
-        If the consumer stops early (client disconnect), the turn is
-        interrupted so Codex doesn't keep spending plan quota.
+        Usage events are cumulative for the turn (all its model calls). If the
+        consumer stops early (client disconnect, or a ToolCall it hands to the
+        client), the turn is interrupted so Codex doesn't keep spending plan
+        quota.
         """
         handle = await thread.turn(
             _to_run_input(input), model=model, effort=effort or settings().default_effort, summary=summary,
             output_schema=output_schema,
         )
         done = False
+        before: Usage | None = None  # thread total before this turn
         try:
             async for n in handle.stream():
                 for ev in map_notification(n.method, _dump(n.payload)):
+                    if isinstance(ev, WebSearchCall) and not allow_web_search:
+                        ev = BlockedItem("webSearch")
                     if isinstance(ev, BlockedItem):
                         self.blocked_items[ev.kind] = self.blocked_items.get(ev.kind, 0) + 1
                         log.warning("codex started a %s item despite chat-only mode; dropped",
                                     ev.kind)
                         continue
+                    if isinstance(ev, TokenCount):
+                        if before is None:
+                            before = usage_minus(ev.total, ev.last)
+                        ev = usage_minus(ev.total, before)
                     done = done or isinstance(ev, TurnDone)
                     yield await self._with_reset_time(ev)
         finally:

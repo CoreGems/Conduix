@@ -9,11 +9,13 @@ from conduix.backend import (
     ReasoningStarted,
     ReasoningSummaryDelta,
     TextDelta,
+    TokenCount,
     TurnDone,
     TurnError,
     Usage,
     map_notification,
     scrub_api_keys,
+    usage_minus,
 )
 
 TID = {"thread_id": "t1", "turn_id": "u1"}
@@ -52,7 +54,7 @@ def test_reasoning_lifecycle():
     ]
 
 
-def test_usage_uses_last_not_total():
+def test_token_usage_carries_last_and_total():
     payload = {
         "token_usage": {
             "last": {"input_tokens": 4418, "cached_input_tokens": 4200, "output_tokens": 9,
@@ -64,7 +66,12 @@ def test_usage_uses_last_not_total():
         },
         **TID,
     }
-    assert map_notification("thread/tokenUsage/updated", payload) == [Usage(4418, 4200, 9, 2, 118)]
+    assert map_notification("thread/tokenUsage/updated", payload) == [
+        TokenCount(last=Usage(4418, 4200, 9, 2, 118), total=Usage(9999, 0, 99, 0, 0))]
+
+
+def test_usage_minus_never_negative():
+    assert usage_minus(Usage(10, 5, 3, 1, 0), Usage(4, 6, 1, 0, 0)) == Usage(6, 0, 2, 1, 0)
 
 
 def test_turn_completed():

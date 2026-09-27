@@ -363,6 +363,49 @@ r = client.responses.create(
 `r.output_text` is then a JSON string matching the schema. Only
 `json_schema` is supported; `{"type": "json_object"}` returns 400.
 
+### Function tools
+
+Declare functions as usual. When the model calls one, the response ends with
+a `function_call` item; run it and send the result back with
+`previous_response_id` (or, with Chat Completions, append the assistant
+message and a `tool` message to `messages`):
+
+```python
+tools = [{"type": "function", "name": "get_weather", "description": "Current weather for a city.",
+          "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                         "required": ["city"]}}]
+
+r = client.responses.create(model="gpt-6-astra", input="Weather in Kyiv?", tools=tools)
+while calls := [o for o in r.output if o.type == "function_call"]:
+    r = client.responses.create(
+        model="gpt-6-astra", tools=tools, previous_response_id=r.id,
+        input=[{"type": "function_call_output", "call_id": c.call_id,
+                "output": get_weather(**json.loads(c.arguments))} for c in calls],
+    )
+print(r.output_text)
+```
+
+- Send the same `tools` on every request of the loop.
+- One function call comes back per response; a model that wants several
+  calls makes them over successive round trips. Handle every
+  `function_call` in `output` anyway.
+- `tool_choice: "none"` turns tools off. `"required"` and forcing a specific
+  function can't be enforced and behave like `"auto"`.
+- Tools can't be combined with `session_id` (use `previous_response_id` or
+  resend the history).
+
+### Web search
+
+```python
+r = client.responses.create(model="gpt-6-astra", tools=[{"type": "web_search"}],
+                            input="What is the latest stable Python release?")
+```
+
+The answer cites its sources as markdown links, and `output` includes
+`web_search_call` items (search / open_page actions). For Chat Completions,
+pass `web_search_options={}`. Searches run live by default
+(`CONDUIX_WEB_SEARCH_MODE=cached` uses Codex's search cache instead).
+
 ---
 
 ## 10. Usage and token counts
@@ -418,8 +461,9 @@ stream ends, not as a dropped connection. Always handle the `error` event.
 | Parameter / feature | Behaviour |
 | ------------------- | --------- |
 | `temperature`, `top_p`, `stop`, `max_output_tokens` | Accepted, but may be **ignored**; `/docs` lists which are applied |
-| Function tools (`tools`, `tool_choice`) | **Not in v1** (planned for v1.1) |
-| Web search tool | **Not in v1** (planned for v1.1) |
+| Function tools | Supported (§9, "Function tools"); `tool_choice` `"required"` / a named function act as `"auto"` |
+| Web search tool | Supported (§9, "Web search"); no `url_citation` annotations, sources are markdown links |
+| Other hosted tools (file search, code interpreter, MCP, computer use) | 400 |
 | Embeddings, audio, image generation, files, Assistants, batch | Not available |
 | `https://` image URLs | Rejected (400) |
 | Parallel requests on one session | Queued, one at a time |

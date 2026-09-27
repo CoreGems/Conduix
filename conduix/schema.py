@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
+import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -66,6 +68,33 @@ class Msg:
             else {"type": kind, "text": p}
             for p in self.parts
         ]}
+
+
+@dataclass
+class FunctionCall:
+    """A function call the model made earlier (history)."""
+    call_id: str
+    name: str
+    arguments: str
+    role = "assistant"
+
+    def to_item(self) -> dict[str, Any]:
+        return {"type": "function_call", "call_id": self.call_id, "name": self.name,
+                "arguments": self.arguments}
+
+
+@dataclass
+class FunctionOutput:
+    """The client's result for a function call."""
+    call_id: str
+    output: str | list[dict[str, Any]]  # text, or input_text / input_image parts
+    role = "tool"
+
+    def to_item(self) -> dict[str, Any]:
+        return {"type": "function_call_output", "call_id": self.call_id, "output": self.output}
+
+
+Item = Msg | FunctionCall | FunctionOutput
 
 
 def _bad(message: str, code: str | None = None) -> APIError:
@@ -128,23 +157,44 @@ def _parts(content: Any) -> list[str | ImagePart]:
     return out
 
 
-def parse_input(input: str | list[dict[str, Any]]) -> list[Msg]:
-    """Normalize Responses `input` to messages.
+def _tool_output(output: Any) -> str | list[dict[str, Any]]:
+    if isinstance(output, str):
+        return output
+    if not isinstance(output, list):
+        raise _bad("function_call_output.output must be a string or a list of content parts")
+    parts: list[dict[str, Any]] = []
+    for p in _parts(output):
+        parts.append({"type": "input_image", "image_url": p.url} if isinstance(p, ImagePart)
+                     else {"type": "input_text", "text": p})
+    return parts
 
-    Accepts a string, easy messages ({role, content}), `message` items, and
-    items copied from an earlier response's `output` (reasoning items there
-    are dropped: they can't be replayed).
+
+def parse_input(input: str | list[dict[str, Any]]) -> list[Item]:
+    """Normalize Responses `input` to messages and function-call items.
+
+    Accepts a string, easy messages ({role, content}), `message` items,
+    `function_call` / `function_call_output` items, and items copied from an
+    earlier response's `output` (reasoning and web_search_call items there are
+    dropped: they can't be replayed).
     """
     if isinstance(input, str):
         return [Msg("user", [input])]
-    msgs = []
+    msgs: list[Item] = []
     for item in input:
         kind = item.get("type", "message")
-        if kind == "reasoning":
+        if kind in ("reasoning", "web_search_call"):
+            continue
+        if kind == "function_call":
+            args = item.get("arguments", "")
+            msgs.append(FunctionCall(item.get("call_id") or "", item.get("name") or "",
+                                     args if isinstance(args, str) else json.dumps(args)))
+            continue
+        if kind == "function_call_output":
+            if not item.get("call_id"):
+                raise _bad("function_call_output needs a call_id")
+            msgs.append(FunctionOutput(item["call_id"], _tool_output(item.get("output", ""))))
             continue
         if kind != "message":
-            if kind in ("function_call", "function_call_output"):
-                raise _bad("function tools are not supported yet (planned for v1.1)")
             raise _bad(f"input item type {kind!r} is not supported")
         role = item.get("role")
         if role not in ROLES:
@@ -156,11 +206,58 @@ def parse_input(input: str | list[dict[str, Any]]) -> list[Msg]:
     return msgs
 
 
-def split_turn(msgs: list[Msg]) -> tuple[list[Msg], list[Msg]]:
-    """(history to inject, new turn): the new turn is the trailing user messages."""
+def split_turn(msgs: list[Item]) -> tuple[list[Item], list[Msg]]:
+    """(history to inject, new turn): the new turn is the trailing user
+    messages. It may be empty when the input ends with function call output:
+    the model then continues from the tool results."""
     i = len(msgs)
-    while i > 0 and msgs[i - 1].role == "user":
+    while i > 0 and isinstance(msgs[i - 1], Msg) and msgs[i - 1].role == "user":
         i -= 1
-    if i == len(msgs):
-        raise _bad("input must end with a user message")
+    if i == len(msgs) and not isinstance(msgs[-1] if msgs else None, FunctionOutput):
+        raise _bad("input must end with a user message or function_call_output")
     return msgs[:i], msgs[i:]
+
+
+# --- tools -------------------------------------------------------------------
+
+_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def parse_tools(tools: list[dict[str, Any]] | None, tool_choice: Any = None,
+                ) -> tuple[list[dict[str, Any]], bool]:
+    """Responses `tools` → (Codex dynamic tool specs, web_search enabled).
+
+    `tool_choice: "none"` drops every tool. "required" or a specific function
+    can't be enforced through Codex, so they are treated as "auto".
+    """
+    if tool_choice == "none" or not tools:
+        return [], False
+    specs: list[dict[str, Any]] = []
+    web_search = False
+    for i, tool in enumerate(tools):
+        kind = tool.get("type")
+        if kind == "function":
+            name = tool.get("name")
+            if not isinstance(name, str) or not _NAME.match(name):
+                raise APIError(400, f"invalid function name {name!r} (a-z, A-Z, 0-9, _ and -, "
+                               "up to 64)", param=f"tools[{i}].name")
+            if any(s["name"] == name for s in specs):
+                raise APIError(400, f"duplicate function name {name!r}", param=f"tools[{i}].name")
+            params = tool.get("parameters") or {"type": "object", "properties": {}}
+            specs.append({"type": "function", "name": name,
+                          "description": tool.get("description") or "", "inputSchema": params})
+        elif isinstance(kind, str) and kind.startswith("web_search"):
+            web_search = True
+        else:
+            raise APIError(400, f"tool type {kind!r} is not supported; use function or "
+                           "web_search", param=f"tools[{i}].type")
+    return specs, web_search
+
+
+def check_tool_outputs(items: list[Item], history: list[dict[str, Any]] = ()) -> None:
+    """Every function_call_output must answer a function call in the history."""
+    known = {it["call_id"] for it in history if it.get("type") == "function_call"}
+    known |= {m.call_id for m in items if isinstance(m, FunctionCall)}
+    for m in items:
+        if isinstance(m, FunctionOutput) and m.call_id not in known:
+            raise _bad(f"no tool call found for function call output with call_id {m.call_id!r}")

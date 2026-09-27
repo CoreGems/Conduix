@@ -17,6 +17,12 @@ Turns answer with a dump of the thread's model-visible history
     RETRY  send a will-retry error notification, then answer normally
     SLOW   stream deltas slowly until turn/interrupt arrives
     CRASH  exit the process mid-turn
+    CALLTOOL  call the thread's first dynamic tool (`item/tool/call` request),
+              then wait for turn/interrupt
+    APPROVE   ask for a command approval (`item/commandExecution/requestApproval`)
+    WEIRD     send a server request the client can't know
+    SEARCH    run a webSearch item (only if the thread enabled web_search)
+    TWICE     two model calls: two thread/tokenUsage/updated notifications
 
 `fake/stats` returns what the server saw, for assertions. Environment:
 FAKE_ACCOUNT=none makes account/read report no login.
@@ -38,7 +44,7 @@ out_lock = threading.Lock()
 threads: dict[str, dict] = {}
 stats: dict = {
     "thread_start_params": [], "injected": [], "turn_start_params": [], "interrupted": [],
-    "unsubscribed": [], "api_key_in_env": any(os.environ.get(k) for k in
+    "unsubscribed": [], "client_replies": [], "api_key_in_env": any(os.environ.get(k) for k in
                                               ("OPENAI_API_KEY", "CODEX_API_KEY")),
 }
 interrupts: set[str] = set()
@@ -94,6 +100,28 @@ def run_turn(thread_id: str, turn_id: str, input_items: list[dict]) -> None:
         notify("error", {**base, "error": err, "willRetry": False})
         complete("failed", err)
         return
+    if "CALLTOOL" in joined and th["tools"]:
+        send({"id": f"srv-{turn_id}", "method": "item/tool/call", "params": {
+            **base, "callId": "exec-1", "namespace": None, "tool": th["tools"][0]["name"],
+            "arguments": {"city": "Kyiv"}}})
+        for _ in range(500):
+            if turn_id in interrupts:
+                complete("interrupted")
+                return
+            time.sleep(0.01)
+        complete("completed")
+        return
+    if "APPROVE" in joined:
+        send({"id": "srv-approve", "method": "item/commandExecution/requestApproval",
+              "params": {**base, "itemId": "c1", "command": "rm -rf /"}})
+    if "WEIRD" in joined:
+        send({"id": "srv-weird", "method": "item/somethingNew/request", "params": base})
+    if "SEARCH" in joined and th["web_search"]:
+        ws = {"type": "webSearch", "id": "ws_1", "query": "python",
+              "action": {"type": "search", "query": "python"}}
+        notify("item/started", {**base, "item": ws, "startedAtMs": now_ms()})
+        done = {**ws, "action": {"type": "openPage", "url": "https://www.python.org/"}}
+        notify("item/completed", {**base, "item": done, "completedAtMs": now_ms()})
     if "RETRY" in joined:
         notify("error", {**base, "error": {"message": "reconnecting..."}, "willRetry": True})
     if "TOOL" in joined:
@@ -121,9 +149,12 @@ def run_turn(thread_id: str, turn_id: str, input_items: list[dict]) -> None:
         notify("item/agentMessage/delta", {**base, "itemId": msg_id, "delta": delta})
     notify("item/completed", {**base, "item": {**item, "text": reply}, "completedAtMs": now_ms()})
     th["history"].append(("assistant", reply))
-    usage = {"inputTokens": 100, "cachedInputTokens": 80, "outputTokens": 5,
-             "reasoningOutputTokens": 0, "totalTokens": 105, "cacheWriteInputTokens": 0}
-    notify("thread/tokenUsage/updated", {**base, "tokenUsage": {"last": usage, "total": usage}})
+    for _ in range(2 if "TWICE" in joined else 1):
+        last = {"inputTokens": 100, "cachedInputTokens": 80, "outputTokens": 5,
+                "reasoningOutputTokens": 0, "totalTokens": 105, "cacheWriteInputTokens": 0}
+        th["total"] = {k: th["total"].get(k, 0) + v for k, v in last.items()}
+        notify("thread/tokenUsage/updated",
+               {**base, "tokenUsage": {"last": last, "total": dict(th["total"])}})
     complete("completed")
 
 
@@ -144,7 +175,10 @@ def handle(method: str, params: dict) -> dict | None:
         resp = json.loads(json.dumps(FIXTURES["thread/start"]))
         tid = str(uuid.uuid4())
         resp["thread"]["id"] = resp["thread"]["sessionId"] = tid
-        threads[tid] = {"history": [], "cwd": params.get("cwd") or resp["cwd"]}
+        threads[tid] = {"history": [], "cwd": params.get("cwd") or resp["cwd"],
+                        "tools": params.get("dynamicTools") or [],
+                        "web_search": (params.get("config") or {}).get("web_search") not in
+                        (None, "disabled"), "total": {}}
         if params.get("developerInstructions"):
             threads[tid]["history"].append(("developer", params["developerInstructions"]))
         return resp
@@ -178,6 +212,9 @@ def main() -> None:
             continue
         msg = json.loads(line)
         if "id" not in msg:  # a notification from the client (e.g. `initialized`)
+            continue
+        if "method" not in msg:  # the client answering one of our requests
+            stats["client_replies"].append(msg)
             continue
         try:
             send({"id": msg["id"], "result": handle(msg["method"], msg.get("params") or {})})

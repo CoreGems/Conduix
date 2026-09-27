@@ -97,9 +97,9 @@ def test_ignored_params_are_accepted(client):
 
 
 @pytest.mark.parametrize("kwargs, param", [
-    ({"messages": user("A"), "tools": [{"type": "function", "function": {"name": "f"}}]}, "tools"),
+    ({"messages": user("A"), "tools": [{"type": "custom", "custom": {"name": "f"}}]}, "tools[0].type"),
     ({"messages": [{"role": "user", "content": "A"},
-                   {"role": "tool", "content": "x", "tool_call_id": "1"}]}, "messages"),
+                   {"role": "tool", "content": "x", "tool_call_id": "1"}]}, "messages"),  # unknown call
     ({"messages": [{"role": "user", "content": [
         {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}]}]}, "messages"),
     ({"messages": [{"role": "user", "content": "A"}, {"role": "assistant", "content": "B"}]},

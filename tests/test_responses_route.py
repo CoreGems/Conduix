@@ -19,11 +19,13 @@ from conduix.backend import (
     MessageDone,
     MessageStarted,
     TextDelta,
+    ToolCall,
     TurnDone,
     TurnError,
     UnknownModelError,
     UnsupportedEffortError,
     Usage,
+    WebSearchCall,
 )
 from conduix.responses_store import ResponseStore
 from conduix.routes import models as models_mod
@@ -33,9 +35,12 @@ from conduix.sessions import SessionManager
 
 
 class FakeThread:
-    def __init__(self, tid, instructions):
+    def __init__(self, tid, instructions, tools=None, web_search=False):
         self.id = tid
         self.instructions = instructions
+        self.tools = tools or []
+        self.web_search = web_search
+        self.interrupted = False
         self.items = []  # (role, text)
 
 
@@ -67,8 +72,9 @@ class FakeBackend:
          "efforts": ["low", "xhigh"], "input_modalities": ["text"]},
     ]
 
-    async def start_thread(self, *, model=None, developer_instructions=None):
-        t = FakeThread(f"thr_{len(self.threads)}", developer_instructions)
+    async def start_thread(self, *, model=None, developer_instructions=None, tools=None,
+                           web_search=False):
+        t = FakeThread(f"thr_{len(self.threads)}", developer_instructions, tools, web_search)
         self.threads.append(t)
         return t
 
@@ -77,8 +83,13 @@ class FakeBackend:
 
     async def inject_items(self, thread, items):
         for it in items:
-            thread.items += [(it["role"], c["text"] if "text" in c else f"<image {len(c['image_url'])}>")
-                             for c in it["content"]]
+            if it["type"] == "function_call":
+                thread.items.append(("call", f"{it['name']}{it['arguments']}#{it['call_id']}"))
+            elif it["type"] == "function_call_output":
+                thread.items.append(("tool", f"{it['output']}#{it['call_id']}"))
+            else:
+                thread.items += [(it["role"], c["text"] if "text" in c
+                                  else f"<image {len(c['image_url'])}>") for c in it["content"]]
 
     async def run_turn(self, thread, input, **kw):
         self.turns.append(kw)
@@ -89,6 +100,16 @@ class FakeBackend:
             raise RuntimeError("transport closed")
         if "DEAD" in texts:
             raise TransportClosedError("app-server exited")
+        if "CALL" in texts and thread.tools:
+            try:
+                yield ToolCall(f"call_{len(self.turns)}", thread.tools[0]["name"], '{"city": "Oslo"}')
+                yield MessageStarted("msg_x")  # must never be reached: the route stops here
+            finally:
+                thread.interrupted = True
+            return
+        if "SEARCH" in texts and kw.get("allow_web_search"):
+            yield WebSearchCall("ws_1", "in_progress", {"type": "search", "query": "q"})
+            yield WebSearchCall("ws_1", "completed", {"type": "openPage", "url": "https://x.test"})
         if "QUOTA" in texts:
             yield TurnError("You've hit your usage limit.", "usageLimitExceeded",
                             resets_at=int(time.time()) + 3600)
@@ -164,7 +185,7 @@ def test_effort_summary_and_schema_reach_codex(client, fb):
         text={"format": {"type": "json_schema", "name": "x", "schema": schema}},
     )
     assert fb.turns[-1] == {"model": "gpt-6-sol", "effort": "high", "summary": "auto",
-                            "output_schema": schema}
+                            "output_schema": schema, "allow_web_search": False}
     assert r.reasoning.effort == "high"
 
 
@@ -279,7 +300,8 @@ def test_session_and_previous_together_is_400(client):
     ({"input": [{"role": "user", "content": "A"}, {"role": "assistant", "content": "B"}]}, "input"),
     ({"input": [{"role": "user", "content": [
         {"type": "input_image", "image_url": "https://example.com/cat.png"}]}]}, "input"),
-    ({"input": "A", "tools": [{"type": "function", "name": "f", "parameters": {}}]}, "tools"),
+    ({"input": "A", "tools": [{"type": "file_search", "vector_store_ids": ["v"]}]}, "tools[0].type"),
+    ({"input": "A", "tools": [{"type": "function", "name": "bad name!"}]}, "tools[0].name"),
     ({"input": "A", "text": {"format": {"type": "json_object"}}}, "text.format.type"),
     ({"input": "A", "model": "nope"}, "model"),
 ])

@@ -264,8 +264,8 @@ injected assistant turn was recalled. Stateless replay and
 | `reasoning.effort`                        | ✅ | Passed through and validated against the model's supported efforts (§3.1) |
 | Reasoning summaries                       | ✅ | As `reasoning` output items (Responses API). Only when the model reasons; empty at low effort (§3.1) |
 | Usage (`input_tokens`, `output_tokens`, `reasoning_tokens`, cached) | ✅ | Taken from `thread/tokenUsage/updated` → `token_usage.last`. Every OpenAI usage field has a direct source (§3.1). |
-| Custom function tools (client-executed)   | 🟡 v1.1 | Pause/resume as in Conduit's `TOOLS_HOWTO.md`: park the turn, emit `function_call`, resume on `function_call_output` |
-| Hosted `web_search`                       | 🟡 v1.1 | Codex has its own web search, which is turned on per request |
+| Custom function tools (client-executed)   | ✅ v1.1 | Codex dynamic tools; on a call the response ends with `function_call` and the turn is interrupted; `function_call_output` resumes on a rebuilt thread (§7, verified live 2026-09-27) |
+| Hosted `web_search`                       | ✅ v1.1 | `tools: [{"type": "web_search"}]` / chat `web_search_options` turn Codex's web search on for that thread (`CONDUIX_WEB_SEARCH_MODE`, default `live`); `web_search_call` output items |
 | `temperature`, `top_p`, `stop`, `max_output_tokens` | ⚠️ | Accepted. Applied where Codex supports them, otherwise ignored, and the docs list which |
 | Structured outputs (`text.format` json_schema) | ✅ | Passed as the turn's `output_schema`; verified live 2026-09-27. `json_object` returns 400 |
 
@@ -313,6 +313,7 @@ start_app.ps1       kill (whole process tree) and restart on port
 | `CONDUIX_WORKSPACE_DIR`          | `%LOCALAPPDATA%\conduix\workspace` |
 | `CONDUIX_SESSION_IDLE_TIMEOUT_S` | `1800`          |
 | `CONDUIX_MAX_SESSIONS`           | `100`           |
+| `CONDUIX_WEB_SEARCH_MODE`        | `live` (or `cached`), used when a request enables web search |
 
 **Billing guard:** at startup, call `codex.account()` and refuse to serve
 unless `account.type == "chatgpt"`. Log `plan_type` and show it on
@@ -355,7 +356,8 @@ passes.
     `tests/fake_app_server.py` speaks the real JSON-RPC protocol (replaying responses recorded
     from a real app-server), so backend.py and the real SDK run offline. Found: `Backend.stop()`
     raised if the app-server had died (SDK close() on Windows); fixed.
-12. **v1.1**: custom function tools (pause/resume), web search.
+12. ✅ **v1.1** (done 2026-09-27): custom function tools, web search. Verified live on both
+    endpoints, incl. a two-round agent loop. Design in §7 ("Custom tools").
 
 ### Acceptance for v1
 
@@ -392,12 +394,37 @@ tools through a prompt has no effect on disk.
   toward plan limits.
 - **Plan tier.** The probe saw `plan_type: "plus"`. Confirm that is the
   intended account, since Plus and Pro have very different Codex limits.
-- **Custom tools.** The SDK's public API has no client-defined function-tool
-  hook. Options: a Conduix-hosted MCP server registered through thread
-  `config` (one per session, with handlers parked on Futures as in Conduit's
-  bridge), or dropping down to raw app-server if it offers dynamic tools.
-  Settle this before v1.1. `ExternalMessage` is **not** a fit, because it
-  injects content without a matching call ID.
+- **Custom tools.** *Settled (step 12).* The SDK's public API has no
+  client-defined function-tool hook, but app-server has **dynamic tools**
+  (found in the Codex binary, verified live): `thread/start` takes
+  `dynamicTools: [{type: "function", name, description, inputSchema}]`
+  (missing from the SDK's ThreadStartParams, so sent raw), and a call arrives
+  as the server *request* `item/tool/call` `{threadId, turnId, callId, tool,
+  arguments}`, answered with `{contentItems: [{type: "inputText", text}],
+  success}`. No MCP server needed.
+  Design: Conduix never answers the request. The response ends with a
+  `function_call` item and the turn is interrupted (no extra model call);
+  the client's `function_call_output` comes back via `previous_response_id`
+  or resent history, and is replayed onto a fresh thread with
+  `thread/inject_items` (function_call + function_call_output items are
+  accepted) followed by an **empty-input turn**, which continues from the
+  tool result (verified live). This avoids parking Codex turns across HTTP
+  requests entirely, works the same for Responses and Chat Completions, and
+  survives restarts. Cost: the model's hidden reasoning isn't carried across
+  a tool call (as with OpenAI's stateless function calling without reasoning
+  items), and one call surfaces per response (parallel calls arrive over
+  successive round trips).
+  Needed a replacement for the SDK's reader loop: it answers every server
+  request immediately from its single reader thread, and its default handler
+  **accepts** command/file-change approvals. Conduix's loop re-routes
+  `item/tool/call` into the turn's notification stream, **declines** every
+  approval (counted in `blocked_agent_items`), and answers unknown requests
+  with a JSON-RPC error.
+  Also found: `BASE_INSTRUCTIONS` ("You have no tools") made the model refuse
+  declared functions; threads with tools or web search get their own wording.
+  And a turn with several model calls sends several `thread/tokenUsage/updated`
+  notifications; per-turn usage is now `total` at the end minus `total`
+  before the turn (it under-reported before).
 - **`max_output_tokens` / `temperature`.** They may not be forwarded to the
   backend at all. If so, document them as advisory.
 - **Remote image URLs.** Codex has deprecated them upstream, so return a 400
