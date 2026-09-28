@@ -202,3 +202,49 @@ async def test_json_mode_incomplete_message_keeps_held_text():
         MessageStarted("m1"), TextDelta("m1", '{"a"'), TurnDone("interrupted")]))]
     assert [e["delta"] for e in out if e["type"] == "response.output_text.delta"] == ['{"a"']
     assert rs.output_text == '{"a"'
+
+
+JSON_SAMPLES = [
+    '{"a": 1}',
+    '```json\n{"a": 1}\n```',
+    '```\n{"a": [1, 2]}```',
+    '  \n```json\n  {"code": "use `x`"}\n```\n',
+    '{"s": "trailing spaces   "}',
+    '``not a fence``',
+    '```json',          # a fence that never gets a body
+    '',
+]
+
+
+@pytest.mark.parametrize("raw", JSON_SAMPLES)
+def test_json_safe_prefix_is_always_a_prefix_of_the_final_text(raw):
+    from conduix.streaming import clean_json_text, json_safe_prefix
+    final = clean_json_text(raw)
+    splits = [[raw[:i], raw[i:]] for i in range(len(raw) + 1)] + [list(raw)]
+    for chunks in splits:
+        sent, seen = "", ""
+        for chunk in chunks:
+            seen += chunk
+            safe = json_safe_prefix(seen)
+            assert safe.startswith(sent)  # never takes back what was sent
+            sent = safe
+        assert final.startswith(sent)
+    assert "```" not in final.replace("`x`", "")
+
+
+async def test_json_mode_streams_token_by_token():
+    reply = '```json\n{"city": "Kyiv", "population": 2952301}\n```'
+    tokens = [reply[i:i + 4] for i in range(0, len(reply), 4)]
+    events = [MessageStarted("m1"), *[TextDelta("m1", t) for t in tokens],
+              MessageDone("m1", reply), TurnDone("completed")]
+    rs = ResponseStream(model="m", json_mode=True)
+    out = [e async for e in stream_response(rs, aiter(events))]
+    for e in out:
+        EVENTS.validate_python(e)
+    deltas = [e["delta"] for e in out if e["type"] == "response.output_text.delta"]
+    assert len(deltas) > 5  # streamed, not one chunk
+    assert "".join(deltas) == '{"city": "Kyiv", "population": 2952301}' == rs.output_text
+    assert not any("`" in d for d in deltas)
+    # the openai stream helper agrees
+    with openai_client(sse_events=out).responses.stream(model="m", input="x") as s:
+        assert s.get_final_response().output_text == rs.output_text

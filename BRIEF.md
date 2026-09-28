@@ -268,7 +268,7 @@ injected assistant turn was recalled. Stateless replay and
 | Hosted `web_search`                       | ✅ v1.1 | `tools: [{"type": "web_search"}]` / chat `web_search_options` turn Codex's web search on for that thread (`CONDUIX_WEB_SEARCH_MODE`, default `live`); `web_search_call` output items |
 | `temperature`, `top_p`, `stop`, `max_output_tokens` | ⚠️ | Accepted. Applied where Codex supports them, otherwise ignored, and the docs list which |
 | Structured outputs (`text.format` json_schema) | ✅ | Passed as the turn's `output_schema`; verified live 2026-09-27. Upstream only accepts strict schemas, and a schema allowing only `{}` never finishes (found live), so it gets a 400 |
-| JSON mode (`json_object`)                 | ✅ | Can't be a schema (no strict "any object"), so it's an instruction on that turn only, plus code-fence stripping; text streams as one delta. Verified live on both endpoints; not guaranteed like json_schema |
+| JSON mode (`json_object`)                 | ✅ | Can't be a schema (no strict "any object"), so it's an instruction on that turn only, plus code-fence stripping done while streaming (`json_safe_prefix`: only an undecided opening fence and a trailing run of backticks/whitespace are held back). Verified live on both endpoints; not guaranteed like json_schema |
 
 ---
 

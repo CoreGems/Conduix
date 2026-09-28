@@ -424,12 +424,12 @@ def test_json_mode_strips_code_fences(client):
     assert r.output_text == '{"a": 1}'
 
 
-def test_json_mode_stream_sends_one_clean_delta(http):
+def test_json_mode_stream_is_clean(http):
     events = sse_events(http.post("/v1/responses", json={
         "input": "FENCED", "text": JSON_MODE, "stream": True}).text)
     deltas = [e["delta"] for e in events if e["type"] == "response.output_text.delta"]
     done = next(e["text"] for e in events if e["type"] == "response.output_text.done")
-    assert deltas == ['{"a": 1}'] and done == '{"a": 1}'
+    assert "".join(deltas) == done == '{"a": 1}' and not any("`" in d for d in deltas)
 
 
 def test_json_mode_hint_is_not_sticky(client, fb):

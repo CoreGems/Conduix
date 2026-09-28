@@ -61,18 +61,44 @@ class _Message:
     phase: str | None
     text: str = ""
     done: bool = False
-    held: str = ""  # JSON mode: deltas held back until the message is done
+    held: str = ""  # JSON mode: the raw text so far (what's sent is cleaned)
+
+
+def _drop_opening_fence(raw: str) -> str | None:
+    """`raw` without leading whitespace and an opening ```` ```lang ```` line.
+    None while that can't be decided yet (the fence line isn't complete)."""
+    s = raw.lstrip()
+    if s.startswith("```") or (s and "```".startswith(s)):
+        if "\n" not in s:
+            return None
+        if s.startswith("```"):
+            s = s.split("\n", 1)[1].lstrip()
+    return s
+
+
+def json_safe_prefix(raw: str) -> str:
+    """JSON mode, while streaming: how much of the cleaned text can be sent now.
+
+    Holds back an undecided opening fence, and a trailing run of backticks or
+    whitespace (it may be the closing fence). The result is always a prefix of
+    clean_json_text() of any continuation, so what was sent never has to be
+    taken back.
+    """
+    s = _drop_opening_fence(raw)
+    if not s:
+        return ""
+    end = len(s)
+    while end and (s[end - 1] == "`" or s[end - 1].isspace()):
+        end -= 1
+    return s[:end]
 
 
 def clean_json_text(text: str) -> str:
     """JSON mode: strip markdown code fences a model may add despite being told
     not to, and warn if what's left isn't a JSON object."""
-    s = text.strip()
-    if s.startswith("```"):
-        s = s.split("\n", 1)[1] if "\n" in s else ""
-        if s.rstrip().endswith("```"):
-            s = s.rstrip()[:-3]
-        s = s.strip()
+    s = (_drop_opening_fence(text) or "").rstrip()
+    if s.endswith("```"):
+        s = s[:-3].rstrip()
     try:
         ok = isinstance(json.loads(s), dict)
     except ValueError:
@@ -136,8 +162,7 @@ class ResponseStream:
         }
         if session_id is not None:
             self.response["session_id"] = session_id  # Conduix extension
-        # JSON mode sends a message's text as one delta when it is done, so
-        # the streamed text and the final (fence-stripped) text always match.
+        # JSON mode strips code fences as the text streams (json_safe_prefix).
         self.json_mode = json_mode
         self._seq = 0
         self._items: dict[str, _Message | _Reasoning | _WebSearch] = {}
@@ -198,9 +223,10 @@ class ResponseStream:
     def _finish_message(self, m: _Message, final_text: str | None, status: str) -> list[dict]:
         out = []
         if final_text is not None:
-            if not m.text and final_text:
-                # Codex sent the whole text without deltas; stream it as one.
-                out.append(self._text_delta(m, final_text))
+            if final_text != m.text and final_text.startswith(m.text):
+                # Text not streamed yet: Codex sent it without deltas, or JSON
+                # mode held back the tail of the reply.
+                out.append(self._text_delta(m, final_text[len(m.text):]))
             elif final_text != m.text:
                 log.warning("message %s: deltas differ from final text; using final text", m.id)
             m.text = final_text
@@ -339,6 +365,9 @@ class ResponseStream:
                 m = self._items[ev.item_id]
             if self.json_mode:
                 m.held += ev.delta
+                safe = json_safe_prefix(m.held)
+                if len(safe) > len(m.text) and safe.startswith(m.text):
+                    out.append(self._text_delta(m, safe[len(m.text):]))
                 return out
             return out + [self._text_delta(m, ev.delta)]
 
@@ -397,7 +426,7 @@ class ResponseStream:
             if item.done:
                 continue
             if isinstance(item, _Message):
-                held = item.held if self.json_mode and item.held else None
+                held = clean_json_text(item.held) if self.json_mode and item.held else None
                 out += self._finish_message(item, held, "incomplete")
             elif isinstance(item, _WebSearch):
                 out += self._web_search(WebSearchCall(item.id, "incomplete"))

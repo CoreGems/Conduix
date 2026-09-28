@@ -4,9 +4,9 @@ How to connect a client to Conduix and use it.
 
 > **Status: v1.1, built and tested.** Everything below works against a live
 > ChatGPT plan (`openai-codex` 0.157.1): Responses and Chat Completions,
-> streaming, three multi-turn styles, images, structured output, function
-> tools and web search. Model names and limits depend on the plan that Codex
-> is logged in to.
+> streaming, three multi-turn styles, images, structured output and JSON
+> mode, function tools and web search. Model names and limits depend on the
+> plan that Codex is logged in to.
 
 ---
 
@@ -22,7 +22,7 @@ Conduix instead. Nothing else changes.
 | | |
 |---|---|
 | Base URL | `http://127.0.0.1:8766/v1` |
-| Auth | None. Send any non-empty API key; it is ignored. |
+| Auth | None. Send any non-empty placeholder key (e.g. `"not-used"`); it is ignored. Don't send your real OpenAI key. |
 | Wire format | OpenAI Responses API and Chat Completions (JSON + SSE) |
 | Reachable from | This machine only (bound to `127.0.0.1`) |
 
@@ -142,10 +142,10 @@ print(c.choices[0].message.content)
 
 ## 5. Streaming
 
-Set `stream=True`. Conduix sends real token-by-token deltas. Expect roughly
-3–4 s before the first token at low effort; after that, tokens arrive quickly.
-If the client disconnects mid-stream, Conduix stops the Codex turn so it
-doesn't keep using your plan quota.
+Set `stream=True`. Conduix sends real token-by-token deltas, JSON mode
+included (§9). Expect roughly 3–4 s before the first token at low effort;
+after that, tokens arrive quickly. If the client disconnects mid-stream,
+Conduix stops the Codex turn so it doesn't keep using your plan quota.
 
 ### Responses API
 
@@ -352,8 +352,15 @@ r = client.responses.create(
 ```
 
 For Chat Completions, use `reasoning_effort="high"`. An effort level the model
-doesn't support returns **400**. Higher effort means slower responses and more
-of your plan quota used.
+doesn't support returns **400** (for example `max` on `gpt-5.5`). To avoid
+that, offer only the values in the model's `efforts` list from `/v1/models`:
+
+```python
+efforts = {m.id: m.model_extra["efforts"] for m in client.models.list()}
+# efforts["gpt-5.5"] == ["low", "medium", "high", "xhigh"]
+```
+
+Higher effort means slower responses and more of your plan quota used.
 
 **Reasoning summaries.** You can ask for them with
 `reasoning={"effort": "high", "summary": "auto"}` (or `"concise"` /
@@ -398,7 +405,7 @@ Download the image and send it as a data URL instead.
 
 ---
 
-## 9. Structured output (JSON schema)
+## 9. Structured output (JSON schema and JSON mode)
 
 ```python
 r = client.responses.create(
@@ -427,10 +434,11 @@ Completions, use `response_format={"type": "json_schema", "json_schema":
 {"name": ..., "schema": ...}}`.
 
 An invalid schema returns **400** `invalid_json_schema`, with the upstream
-message. Two rules come from the upstream API:
-- Schemas must be strict (`additionalProperties: false`).
-- A schema that only allows an empty object is rejected up front, because
-  the model can't finish such a reply.
+message. Two rules to know:
+- **Schemas must be strict** (`additionalProperties: false` on every object).
+  The upstream API rejects anything looser.
+- **A schema that only allows an empty object is rejected up front.** That's
+  Conduix's own check: the model never finishes such a reply.
 
 ### JSON mode
 
@@ -439,6 +447,8 @@ message. Two rules come from the upstream API:
 fixed schema:
 
 ```python
+import json
+
 r = client.responses.create(model="gpt-6-astra", text={"format": {"type": "json_object"}},
                             input="Give me three fun facts about octopuses.")
 facts = json.loads(r.output_text)   # e.g. {"facts": [...]}
@@ -450,8 +460,10 @@ It works differently from api.openai.com:
   JSON object. It then strips any markdown code fences. In testing every
   reply parsed, but it isn't guaranteed like `json_schema` is. Parse
   defensively, or use `json_schema` when the shape is known.
-- **One chunk when streaming.** The text arrives as a single delta once the
-  answer is complete, so the streamed text always matches the final text.
+- **Streams normally.** Fences are stripped as the text streams, so deltas
+  arrive token by token and add up to exactly the final text. Only a few
+  characters at the very start, and a trailing run of backticks or spaces,
+  wait until it's clear they're not part of a fence.
 
 ---
 
@@ -542,6 +554,9 @@ print(r.output_text)
   `find_in_page` actions.
 - `web_search_preview` works too.
 - For Chat Completions, pass `web_search_options={}`.
+- Extra options on the tool or in `web_search_options` (`search_context_size`,
+  `user_location`, ...) are accepted and ignored, so you don't need to strip
+  them.
 - You can combine web search with function tools in one request.
 
 Searches run live by default. The server operator can set
@@ -615,6 +630,7 @@ Errors use OpenAI's error envelope:
 | `text.format` / `response_format` `json_object` | Supported, but instructed rather than guaranteed (§9, "JSON mode") |
 | `tool_choice` `"required"` or a named function | Behaves like `"auto"` |
 | Web search citations | Markdown links in the text; no `url_citation` annotations |
+| Web search options (`search_context_size`, `user_location`) | Accepted and ignored |
 | Other hosted tools (file search, code interpreter, MCP, computer use) | 400 |
 | Tools together with `session_id` | 400 |
 | Legacy function calling (Chat Completions) | `function_call` / `role: "function"` messages return 400, and a `functions` parameter is ignored; use `tools` |
@@ -639,6 +655,10 @@ beyond the web search you enable. Conduix runs Codex in a locked-down mode:
   requests, so there is no per-request startup cost.
 - **Keep effort low for chat.** Raise it only when the task needs it, because
   it costs both latency and plan quota.
+- **Build pickers from `/v1/models`.** It has the plan's real model list and
+  each model's valid efforts, so a UI never offers a combination that fails.
+- **Prefer the Responses API.** Everything works on both endpoints, but the
+  Responses API also returns reasoning summaries and `web_search_call` items.
 - **Keep tool loops short.** Every tool round trip is another request, and the
   history is replayed each time.
 - **It runs alongside Conduit.** Conduit (Claude, Anthropic API) is on `:8765`
