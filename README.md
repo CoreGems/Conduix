@@ -25,7 +25,7 @@ which does the same for a Claude Max plan behind an Anthropic-compatible
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8766/v1", api_key="not-used")
+client = OpenAI(base_url="http://127.0.0.1:8766/v1", api_key="not-used")  # any placeholder key
 
 r = client.responses.create(model="gpt-6-astra", input="Say hi in three words.")
 print(r.output_text)
@@ -42,7 +42,7 @@ examples.
 | **Multi-turn**, three ways | Resend the history, `previous_response_id` (with branching), or the `session_id` extension | [§6](./CONDUIX_API_USEAGE_GUIDE.md#6-multi-turn-conversations) |
 | **Models and reasoning effort** | `/v1/models` lists the plan's models and each one's `effort` values; reasoning summaries | [§7](./CONDUIX_API_USEAGE_GUIDE.md#7-models-and-reasoning-effort) |
 | **Images** | Base64 data URLs (PNG / JPEG / GIF / WebP), remembered across turns | [§8](./CONDUIX_API_USEAGE_GUIDE.md#8-images) |
-| **Structured output** | `json_schema` via `text.format` / `response_format`, and JSON mode (`json_object`) | [§9](./CONDUIX_API_USEAGE_GUIDE.md#9-structured-output-json-schema-and-json-mode) |
+| **Structured output** | `json_schema` (strict schemas) via `text.format` / `response_format`. JSON mode (`json_object`) also works: best effort, streamed token by token, with code fences stripped | [§9](./CONDUIX_API_USEAGE_GUIDE.md#9-structured-output-json-schema-and-json-mode) |
 | **Function tools** | Client-executed function calling on both endpoints, streaming included | [§10](./CONDUIX_API_USEAGE_GUIDE.md#10-function-tools) |
 | **Web search** | `tools: [{"type": "web_search"}]`, or `web_search_options` in Chat Completions | [§11](./CONDUIX_API_USEAGE_GUIDE.md#11-web-search) |
 | **Usage** | OpenAI-style token counts; `/health` shows how much of the plan's usage window is used | [§12](./CONDUIX_API_USEAGE_GUIDE.md#12-usage-and-token-counts) |
@@ -66,6 +66,27 @@ while calls := [o for o in r.output if o.type == "function_call"]:
     )
 print(r.output_text)
 ```
+
+### Connecting an app
+
+Lessons from wiring Conduix into an existing OpenAI client:
+
+- **Placeholder key.** Send a placeholder API key such as `"not-used"`. Make
+  sure the app can't fall back to a real `OPENAI_API_KEY` or to
+  `api.openai.com`.
+- **Prefer the Responses API.** Both endpoints support effort, tools, JSON mode
+  and web search. Only the Responses API returns reasoning summaries and
+  `web_search_call` items.
+- **Build pickers from `/v1/models`.** It lists the plan's real models and
+  each model's valid `efforts`. Offering an effort a model doesn't support
+  (e.g. `max` on `gpt-5.5`) gets a 400.
+- **Nothing extra to strip.** JSON mode and web-search options
+  (`search_context_size`, `user_location`) are accepted, and unsupported
+  sampling parameters are ignored.
+- **Parse JSON defensively.** `json_object` output is instructed, not
+  guaranteed. Use `json_schema` when the shape is known.
+- **No cost figures.** Usage counts against the ChatGPT plan's limits, not
+  money. `/health` shows how much of the usage window is used.
 
 ## Endpoints
 
@@ -107,6 +128,10 @@ The SDK pins and installs its own matching Codex CLI binary.
 .\start_app.ps1 -Reload    # dev mode
 .\start_app.ps1 -Port 9000
 ```
+
+Restarting replaces the running server, so any app using it is disconnected
+briefly, and sessions and `previous_response_id` history are lost. Check
+with `curl http://127.0.0.1:8766/health` before restarting.
 
 ### Configuration
 
@@ -177,6 +202,10 @@ FastAPI ──► SessionManager ──► AsyncCodex (openai-codex SDK)
   2. The client's result comes back in the next request.
   3. Conduix replays the conversation on a fresh thread, and the model
      continues from the result.
+- **JSON mode is an instruction, not a schema.** Codex's upstream only
+  accepts strict schemas, so "any JSON object" can't be expressed as one.
+  Conduix tells the model, for that turn only, to answer with one JSON
+  object, and strips code fences as the text streams.
 
 ## Docs
 
@@ -199,6 +228,9 @@ FastAPI ──► SessionManager ──► AsyncCodex (openai-codex SDK)
   - One call comes back per response.
   - `tool_choice: "required"` behaves like `"auto"`.
   - Tools can't be combined with `session_id`.
+- **Structured output:**
+  - `json_schema` must be strict (`additionalProperties: false`).
+  - JSON mode (`json_object`) is best effort, not guaranteed.
 - **Ignored parameters:** sampling parameters (`temperature`, `top_p`,
   `max_output_tokens`, ...) are accepted and ignored, because Codex has no
   setting for them.
