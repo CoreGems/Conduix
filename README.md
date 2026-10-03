@@ -16,7 +16,7 @@ which does the same for a Claude Max plan behind an Anthropic-compatible
 `/v1/messages` API. The two are designed to run side by side, with Conduit on
 `:8765` and Conduix on `:8766`.
 
-> **Status: v1.1.** Everything below is built and tested: offline against a
+> **Status: v1.2.** Everything below is built and tested: offline against a
 > fake Codex app-server, and live against a ChatGPT plan through the official
 > `openai` SDK. See [`BRIEF.md`](./BRIEF.md) §6 for the build log.
 
@@ -42,6 +42,7 @@ examples.
 | **Multi-turn**, three ways | Resend the history, `previous_response_id` (with branching), or the `session_id` extension | [§6](./CONDUIX_API_USEAGE_GUIDE.md#6-multi-turn-conversations) |
 | **Models and reasoning effort** | `/v1/models` lists the plan's models and each one's `effort` values; reasoning summaries | [§7](./CONDUIX_API_USEAGE_GUIDE.md#7-models-and-reasoning-effort) |
 | **Images** | Base64 data URLs (PNG / JPEG / GIF / WebP), remembered across turns | [§8](./CONDUIX_API_USEAGE_GUIDE.md#8-images) |
+| **Image generation** | `/v1/images/generations`, or `tools: [{"type": "image_generation"}]` on the Responses API. PNG as base64; follow-up edits work | [§8](./CONDUIX_API_USEAGE_GUIDE.md#generating-images) |
 | **Structured output** | `json_schema` (strict schemas) via `text.format` / `response_format`. JSON mode (`json_object`) also works: best effort, streamed token by token, with code fences stripped | [§9](./CONDUIX_API_USEAGE_GUIDE.md#9-structured-output-json-schema-and-json-mode) |
 | **Function tools** | Client-executed function calling on both endpoints, streaming included | [§10](./CONDUIX_API_USEAGE_GUIDE.md#10-function-tools) |
 | **Web search** | `tools: [{"type": "web_search"}]`, or `web_search_options` in Chat Completions | [§11](./CONDUIX_API_USEAGE_GUIDE.md#11-web-search) |
@@ -65,6 +66,15 @@ while calls := [o for o in r.output if o.type == "function_call"]:
                 "output": get_weather(**json.loads(c.arguments))} for c in calls],
     )
 print(r.output_text)
+```
+
+Generating an image also looks the same:
+
+```python
+import base64
+
+img = client.images.generate(model="gpt-image-1", prompt="A watercolor fox in a snowy forest.")
+open("fox.png", "wb").write(base64.b64decode(img.data[0].b64_json))
 ```
 
 ### Connecting an app
@@ -94,6 +104,7 @@ Lessons from wiring Conduix into an existing OpenAI client:
 | ------ | ----------------------- | ----------------------------------------- |
 | POST   | `/v1/responses`         | OpenAI Responses API (primary)            |
 | POST   | `/v1/chat/completions`  | OpenAI Chat Completions                   |
+| POST   | `/v1/images/generations` | OpenAI Images API (generate)             |
 | GET    | `/v1/models`            | Models available on your plan             |
 | GET    | `/v1/models/{id}`       | One model, with its `effort` values       |
 | GET    | `/v1/sessions`          | List active sessions                      |
@@ -173,6 +184,9 @@ This sends three short chat-only turns through Codex and logs every event to
 conda run -n conduix --no-capture-output python scripts/probe_sdk.py
 ```
 
+`scripts/probe_image_gen.py` does the same for image generation. It
+generates one image, which counts against the plan's usage limit.
+
 ## Architecture
 
 ```
@@ -202,6 +216,11 @@ FastAPI ──► SessionManager ──► AsyncCodex (openai-codex SDK)
   2. The client's result comes back in the next request.
   3. Conduix replays the conversation on a fresh thread, and the model
      continues from the result.
+- **Image generation uses Codex's built-in image tool.** It is switched on
+  only for a thread whose request asks for it. Codex also saves each image
+  under `~/.codex/generated_images`; Conduix deletes that copy once the
+  image is in the response. An earlier image is replayed to the model as an
+  image message, so follow-ups and edits work on a rebuilt thread too.
 - **JSON mode is an instruction, not a schema.** Codex's upstream only
   accepts strict schemas, so "any JSON object" can't be expressed as one.
   Conduix tells the model, for that turn only, to answer with one JSON
@@ -231,6 +250,14 @@ FastAPI ──► SessionManager ──► AsyncCodex (openai-codex SDK)
 - **Structured output:**
   - `json_schema` must be strict (`additionalProperties: false`).
   - JSON mode (`json_object`) is best effort, not guaranteed.
+- **Image generation:**
+  - One PNG per request (`n=1`), returned as base64, never as a URL. No
+    streaming of partial images, and no `/v1/images/edits`.
+  - It counts against the plan's usage limit (the window on `/health`), and
+    an image costs more of it than a text turn.
+  - `size`, `quality` and the image `model` can't be enforced. The images
+    endpoint passes `size` and `background` to the model as a hint.
+  - Not available on Chat Completions or with `session_id`.
 - **Ignored parameters:** sampling parameters (`temperature`, `top_p`,
   `max_output_tokens`, ...) are accepted and ignored, because Codex has no
   setting for them.

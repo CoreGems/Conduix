@@ -181,3 +181,36 @@ def test_web_search(client):
     r = client.responses.create(model=M, reasoning=LOW, tools=[{"type": "web_search"}], input=(
         "Search the web: what is the latest stable Python 3 release? One sentence with the version."))
     assert "web_search_call" in [o.type for o in r.output] and "3." in r.output_text
+
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+COLOUR = "What colour is the square in the image you generated? One lowercase word."
+
+
+def test_image_generation(client):
+    """One image (it counts against the plan's usage limit), then two text turns."""
+    tool = {"type": "image_generation"}
+    before = health()["blocked_agent_items"]
+    r1 = client.responses.create(model=M, reasoning=LOW, tools=[tool], input=(
+        "Generate an image: a solid blue square centered on a plain white background."))
+    [image] = [o for o in r1.output if o.type == "image_generation_call"]
+    assert image.status == "completed" and image.output_format == "png"
+    assert base64.b64decode(image.result).startswith(PNG_MAGIC)
+    # Codex's own copy of the image is removed from ~/.codex/generated_images.
+    assert not list((Path.home() / ".codex" / "generated_images").glob(f"*/{image.id}.*"))
+    assert health()["blocked_agent_items"] == before
+
+    # Same tools: the thread continues. The model still has the image.
+    r2 = client.responses.create(model=M, reasoning=LOW, tools=[tool], input=COLOUR,
+                                 previous_response_id=r1.id)
+    assert "blue" in r2.output_text.lower()
+    # No tools: the history is rebuilt on a new thread, with the image replayed.
+    r3 = client.responses.create(model=M, reasoning=LOW, input=COLOUR, previous_response_id=r1.id)
+    assert "blue" in r3.output_text.lower()
+
+
+def test_images_generate(client):
+    r = client.images.generate(model="gpt-image-1", prompt=(
+        "A solid green triangle centered on a plain white background."))
+    assert base64.b64decode(r.data[0].b64_json).startswith(PNG_MAGIC)
+    assert r.output_format == "png" and "x" in r.size

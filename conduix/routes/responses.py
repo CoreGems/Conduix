@@ -35,6 +35,8 @@ from conduix.schema import (
     Msg,
     ResponseCreateRequest,
     check_tool_outputs,
+    generated_image,
+    image_data_url,
     parse_input,
     parse_tools,
     split_turn,
@@ -59,13 +61,14 @@ class Plan:
     prev: StoredResponse | None
     tools: list[dict[str, Any]] = field(default_factory=list)  # Codex dynamic tool specs
     web_search: bool = False
+    image_generation: bool = False
     tool_called: bool = False  # set when the turn ended on a function call
     json_mode: bool = False  # text.format json_object
 
     @property
     def tools_key(self) -> str:
-        return json.dumps([self.tools, self.web_search], sort_keys=True) if (
-            self.tools or self.web_search) else ""
+        key = [self.tools, self.web_search, self.image_generation]
+        return json.dumps(key, sort_keys=True) if any(key) else ""
 
 
 def _has_images(item: Item) -> bool:
@@ -109,10 +112,11 @@ def _output_schema(text: dict[str, Any] | None) -> tuple[dict[str, Any] | None, 
 
 def plan(req: ResponseCreateRequest) -> Plan:
     """Validate the request. Every 4xx is raised here, before any streaming."""
-    tools, web_search = parse_tools(req.tools, req.tool_choice)
-    if req.session_id and (tools or web_search):
+    tools, web_search, image_generation = parse_tools(req.tools, req.tool_choice)
+    if req.session_id and (tools or web_search or image_generation):
         # A tool call ends the turn and needs a fresh thread to resume on,
-        # which a long-lived session thread can't give.
+        # which a long-lived session thread can't give. Web search and image
+        # generation are fixed when a thread starts.
         raise APIError(400, "tools can't be combined with session_id; use previous_response_id "
                        "or resend the history", param="tools")
     if req.session_id and req.previous_response_id:
@@ -131,7 +135,7 @@ def plan(req: ResponseCreateRequest) -> Plan:
         requested_model = requested_model or sess.model
         effort = effort or sess.effort
     model = backend.resolve_model(requested_model, effort)
-    msgs = parse_input(req.input)
+    msgs = parse_input(req.input, lambda image_id: store.image(image_id))
     history, new = split_turn(msgs)
     if any(_has_images(m) for m in msgs) and not backend.supports_images(model):
         raise APIError(400, f"model {backend.model_name(model)!r} does not accept image input",
@@ -153,19 +157,25 @@ def plan(req: ResponseCreateRequest) -> Plan:
     check_tool_outputs(msgs, store.history(prev.id) if prev else [])
     output_schema, json_mode = _output_schema(req.text)
     return Plan(req, model, effort, summary, output_schema, history, new, prev,
-                tools=tools, web_search=web_search, json_mode=json_mode)
+                tools=tools, web_search=web_search, image_generation=image_generation,
+                json_mode=json_mode)
 
 
-def _output_items(rs: ResponseStream) -> list[dict[str, Any]]:
-    """The response's output as replayable history (messages and function calls)."""
-    out = []
+def _output_items(rs: ResponseStream) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """The response's output as replayable history (messages, function calls
+    and generated images), and its generated images by id."""
+    out, images = [], {}
     for item in rs.response["output"]:
         if item["type"] == "message":
             texts = [c["text"] for c in item["content"] if c["type"] == "output_text"]
-            out.append(Msg("assistant", texts).to_item())
+            if any(texts):  # after an image the model's closing message is empty
+                out.append(Msg("assistant", texts).to_item())
         elif item["type"] == "function_call":
             out.append(FunctionCall(item["call_id"], item["name"], item["arguments"]).to_item())
-    return out
+        elif item["type"] == "image_generation_call" and item.get("result"):
+            url = images[item["id"]] = image_data_url(item["result"])
+            out.append(generated_image(url).to_item())
+    return out, images
 
 
 async def _turn(
@@ -183,6 +193,7 @@ async def _turn(
     async with aclosing(backend.run_turn(
         sess.thread, turn_input, model=p.model, effort=p.effort,
         summary=p.summary, output_schema=p.output_schema, allow_web_search=p.web_search,
+        allow_image_generation=p.image_generation,
     )) as events:
         async for ev in events:
             yield ev
@@ -198,10 +209,11 @@ async def _turn(
 
     # The consumer has fed every event to `rs` by the time we resume here.
     if rs.response["status"] == "completed" and p.req.store:
+        output, images = _output_items(rs)
         store.add(StoredResponse(
             id=rs.id, session_id=sess.id, parent_id=parent_id,
-            items=own + [m.to_item() for m in p.new] + _output_items(rs),
-            instructions=p.req.instructions,
+            items=own + [m.to_item() for m in p.new] + output,
+            instructions=p.req.instructions, images=images,
         ))
         if not p.tool_called:  # an interrupted thread can't be continued
             sess.head_response_id = rs.id
@@ -241,7 +253,8 @@ async def run_events(p: Plan, rs: ResponseStream) -> AsyncIterator[Event]:
         base = store.history(p.prev.id)
 
     sess = await manager.create(model=p.model, instructions=req.instructions, implicit=True,
-                                tools=p.tools, web_search=p.web_search, tools_key=p.tools_key)
+                                tools=p.tools, web_search=p.web_search,
+                                image_generation=p.image_generation, tools_key=p.tools_key)
     try:
         async with manager.use(sess.id) as sess:
             async with aclosing(_turn(p, rs, sess, base=base, own=own,

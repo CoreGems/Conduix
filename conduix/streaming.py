@@ -15,6 +15,9 @@ Event order for one message (same as api.openai.com):
   response.completed | response.failed | response.incomplete
 Reasoning items add response.reasoning_summary_part.added /
 reasoning_summary_text.delta / .done / part.done in place of the text events.
+A generated image is one image_generation_call item: output_item.added,
+response.image_generation_call.in_progress / .generating / .completed,
+output_item.done (with the image in `result`).
 
 Chat Completions chunks (step 9) will be derived from the same events.
 """
@@ -32,6 +35,7 @@ from typing import Any
 
 from conduix.backend import (
     Event,
+    ImageGenerationCall,
     MessageDone,
     MessageStarted,
     ReasoningDone,
@@ -46,6 +50,7 @@ from conduix.backend import (
 )
 
 from conduix.errors import resolve
+from conduix.schema import image_info
 
 log = logging.getLogger("conduix.streaming")
 
@@ -116,6 +121,13 @@ class _WebSearch:
 
 
 @dataclass
+class _ImageGeneration:
+    index: int
+    id: str
+    done: bool = False
+
+
+@dataclass
 class _Reasoning:
     index: int
     id: str
@@ -165,7 +177,7 @@ class ResponseStream:
         # JSON mode strips code fences as the text streams (json_safe_prefix).
         self.json_mode = json_mode
         self._seq = 0
-        self._items: dict[str, _Message | _Reasoning | _WebSearch] = {}
+        self._items: dict[str, _Message | _Reasoning | _WebSearch | _ImageGeneration] = {}
         self.tool_calls: list[dict[str, Any]] = []  # function_call items, in order
         self._error: TurnError | None = None
         self.failure: TurnError | None = None  # set when the turn failed
@@ -335,6 +347,42 @@ class ResponseStream:
                               item=copy.deepcopy(item)))
         return out
 
+    def _image_generation(self, ev: ImageGenerationCall) -> list[dict]:
+        ig = self._items.get(ev.item_id)
+        out = []
+        if not isinstance(ig, _ImageGeneration):
+            ig = _ImageGeneration(index=len(self.response["output"]), id=ev.item_id)
+            self._items[ig.id] = ig
+            self._add_item({"id": ig.id, "type": "image_generation_call",
+                            "status": "in_progress", "result": None})
+            out = [
+                self._emit("response.output_item.added", output_index=ig.index,
+                           item=copy.deepcopy(self.response["output"][ig.index])),
+                self._emit("response.image_generation_call.in_progress", item_id=ig.id,
+                           output_index=ig.index),
+                self._emit("response.image_generation_call.generating", item_id=ig.id,
+                           output_index=ig.index),
+            ]
+        if ev.status == "in_progress":
+            return out
+        ig.done = True
+        item = self.response["output"][ig.index]
+        item["status"] = ev.status
+        if ev.revised_prompt:
+            item["revised_prompt"] = ev.revised_prompt
+        if ev.status == "completed":
+            item["result"] = ev.result
+            item["output_format"], size = image_info(ev.result)
+            if size:
+                item["size"] = size
+            if ev.transparent_background is not None:
+                item["background"] = "transparent" if ev.transparent_background else "opaque"
+            out.append(self._emit("response.image_generation_call.completed", item_id=ig.id,
+                                  output_index=ig.index))
+        out.append(self._emit("response.output_item.done", output_index=ig.index,
+                              item=copy.deepcopy(item)))
+        return out
+
     # --- public --------------------------------------------------------------
 
     def start(self) -> list[dict]:
@@ -397,6 +445,9 @@ class ResponseStream:
         if isinstance(ev, WebSearchCall):
             return self._web_search(ev)
 
+        if isinstance(ev, ImageGenerationCall):
+            return self._image_generation(ev)
+
         if isinstance(ev, Usage):
             self.response["usage"] = {
                 "input_tokens": ev.input_tokens,
@@ -430,6 +481,8 @@ class ResponseStream:
                 out += self._finish_message(item, held, "incomplete")
             elif isinstance(item, _WebSearch):
                 out += self._web_search(WebSearchCall(item.id, "incomplete"))
+            elif isinstance(item, _ImageGeneration):
+                out += self._image_generation(ImageGenerationCall(item.id, "failed"))
             else:
                 out += self._finish_reasoning(item, None)
 

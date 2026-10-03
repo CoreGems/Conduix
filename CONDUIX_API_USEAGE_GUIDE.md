@@ -2,11 +2,11 @@
 
 How to connect a client to Conduix and use it.
 
-> **Status: v1.1, built and tested.** Everything below works against a live
+> **Status: v1.2, built and tested.** Everything below works against a live
 > ChatGPT plan (`openai-codex` 0.157.1): Responses and Chat Completions,
-> streaming, three multi-turn styles, images, structured output and JSON
-> mode, function tools and web search. Model names and limits depend on the
-> plan that Codex is logged in to.
+> streaming, three multi-turn styles, images, image generation, structured
+> output and JSON mode, function tools and web search. Model names and limits
+> depend on the plan that Codex is logged in to.
 
 ---
 
@@ -77,6 +77,7 @@ A Swagger console for trying requests by hand is at
 | ------ | ----------------------- | ---------- |
 | POST   | `/v1/responses`         | **Recommended.** OpenAI Responses API |
 | POST   | `/v1/chat/completions`  | OpenAI Chat Completions, for older clients and tools |
+| POST   | `/v1/images/generations` | OpenAI Images API: generate an image (§8) |
 | GET    | `/v1/models`            | Models your plan can use |
 | GET    | `/v1/models/{id}`       | One model, with its supported `effort` values |
 | POST   | `/v1/sessions`          | Create a server-side conversation → `{session_id}` |
@@ -162,13 +163,14 @@ The events follow api.openai.com's order:
 | Event | Meaning |
 | ----- | ------- |
 | `response.created`, `response.in_progress` | Request accepted |
-| `response.output_item.added` | An item started: `message`, `reasoning`, `function_call` or `web_search_call` |
+| `response.output_item.added` | An item started: `message`, `reasoning`, `function_call`, `web_search_call` or `image_generation_call` |
 | `response.content_part.added` | A message's text part started |
 | `response.output_text.delta` | Next chunk of text |
 | `response.output_text.done`, `response.content_part.done` | Full text of the part |
 | `response.reasoning_summary_part.added`, `response.reasoning_summary_text.delta` / `.done`, `response.reasoning_summary_part.done` | Reasoning summary (§7) |
 | `response.function_call_arguments.delta` / `.done` | A function call's arguments (§10) |
 | `response.web_search_call.in_progress` / `.searching` / `.completed` | A web search (§11) |
+| `response.image_generation_call.in_progress` / `.generating` / `.completed` | An image being generated (§8). The image itself is in the `response.output_item.done` that follows |
 | `response.output_item.done` | Item finished |
 | `response.completed` | Done. Carries the final `response`, including `usage` |
 | `error`, then `response.failed` | The turn failed (see §13) |
@@ -247,7 +249,8 @@ r2 = client.responses.create(model="gpt-6-astra", input=history)
 - Earlier turns reach the model as real user / assistant / system messages,
   not as text pasted into the prompt.
 - You can append `r1.output` items directly. Reasoning and
-  `web_search_call` items in it are skipped.
+  `web_search_call` items in it are skipped. An `image_generation_call`
+  item puts its image back in front of the model (§8).
 - `function_call` / `function_call_output` items are accepted too (§10).
 - For Chat Completions this is just `messages`.
 
@@ -402,6 +405,95 @@ Download the image and send it as a data URL instead.
 - Images in earlier turns are remembered: in resent history, with
   `previous_response_id`, and in sessions.
 - Sending an image to a model without image input returns **400**.
+
+### Generating images
+
+Images are generated on your ChatGPT plan by Codex's built-in image tool.
+There are two ways to ask for one. Either way the image comes back as
+**base64 PNG**, and takes about 20–30 seconds.
+
+**Images API**, for a single image from a prompt:
+
+```python
+import base64
+
+img = client.images.generate(
+    model="gpt-image-1",                      # accepted; see the notes below
+    prompt="A watercolor fox in a snowy forest.",
+    size="1536x1024",                         # optional hint
+)
+open("fox.png", "wb").write(base64.b64decode(img.data[0].b64_json))
+print(img.data[0].revised_prompt, img.size)
+```
+
+**Responses API**, when images are part of a conversation:
+
+```python
+tools = [{"type": "image_generation"}]
+
+r1 = client.responses.create(model="gpt-6-astra", tools=tools,
+                             input="Draw a blue square on a white background.")
+image = next(o for o in r1.output if o.type == "image_generation_call")
+open("square.png", "wb").write(base64.b64decode(image.result))
+
+# Follow up: the model still has the image, so it can change it.
+r2 = client.responses.create(model="gpt-6-astra", tools=tools, previous_response_id=r1.id,
+                             input="Make the square red instead.")
+```
+
+- The `image_generation_call` item has `result` (the image), `revised_prompt`
+  (what the image tool was actually asked for), `output_format` (`png`) and
+  `size`.
+- The model decides when to use the tool. A request that isn't about an
+  image gets a normal text answer.
+- The response may end with a `message` item whose text is empty. Read the
+  image from the `image_generation_call` item.
+
+**Continuing with an image.** All three stateless forms work:
+
+- `previous_response_id`, as above.
+- Resend the history with `r1.output` in it (§6A).
+- OpenAI's "edit this one" form, naming an earlier image by id:
+  ```python
+  r2 = client.responses.create(model="gpt-6-astra", tools=tools, input=[
+      {"role": "user", "content": "Make the square red instead."},
+      {"type": "image_generation_call", "id": image.id},
+  ])
+  ```
+  The id is looked up among the stored responses, so this needs the first
+  response to have been stored (the default) and the server not restarted.
+  Otherwise it returns **400** `image_not_found`; send the item with its
+  `result` instead.
+
+An earlier image reaches the model as an image message marked as generated
+by the assistant, so a later request can ask about it even without the tool.
+
+**Notes and limits:**
+
+- **One image per request.** `n` above 1 returns **400**.
+- **Base64 only.** `response_format: "url"` returns **400**.
+- **No streaming on the Images API** (`stream: true` returns **400**). On the
+  Responses API the stream reports progress (§5); there are no partial
+  images.
+- **`model` on the Images API** names an image model in OpenAI's API. Here it
+  can't be chosen: any value is accepted. If it names one of your plan's chat
+  models, that model writes the image request; otherwise the default does.
+- **Size, quality and background can't be enforced**, because the model
+  writes the image request itself. The Images API passes `size` and
+  `background` to it as a hint (a requested `1536x1024` came back at exactly
+  that size in testing). On the Responses API the tool's options are
+  ignored: put what you want in the prompt.
+- **It uses your plan's usage limit.** Images count against the same usage
+  window that `/health` shows, and an image costs more of it than a text
+  turn. When the limit is reached, the Images API returns **429** with the
+  reset time; on the Responses API the item comes back with
+  `status: "failed"`. This case is built from Codex's protocol types and
+  tested offline; it has not been seen live.
+- **Not on Chat Completions** (it has no image output), and not together
+  with `session_id`.
+- **No usage on the Images API.** `usage` is omitted there. On the Responses
+  API it counts the chat model's tokens; a generated image adds roughly 2k
+  input tokens, because the model looks at what it made.
 
 ---
 
@@ -604,12 +696,14 @@ Errors use OpenAI's error envelope:
 | ------ | ------ | ------- | ---------- |
 | 400 | `unsupported_value`, `model_not_found`, `invalid_json_schema`, `context_length_exceeded`, ... | Bad request: unsupported `effort`, unknown model, invalid schema, unknown tool `call_id`, conversation too long | Fix the request; `param` names the field |
 | 400 | `invalid_image_url`, `unsupported_image_media_type`, `invalid_base64_image`, `image_too_large`, `empty_image_file` | Bad image (§8) | Send a valid base64 data URL |
+| 400 | `image_not_found` | An `image_generation_call` named by `id` isn't among the stored responses (§8) | Send the item with its `result` |
 | 401 | `codex_unauthorized` | Codex's login is no longer valid | Server operator runs `codex login` |
 | 404 | `not_found` | Unknown `session_id` / `previous_response_id` / model (expired or server restarted) | Start a new conversation, or resend the history (§6A) |
-| 429 | `usage_limit_exceeded` | **Plan usage limit reached.** The message says when it resets; `retry-after` is set and `x-should-retry: false` stops the `openai` SDK retrying | Wait for the reset; retrying won't help |
+| 429 | `usage_limit_exceeded` | **Plan usage limit reached** (also when it is reached while generating an image, §8). The message says when it resets; `retry-after` is set and `x-should-retry: false` stops the `openai` SDK retrying | Wait for the reset; retrying won't help |
 | 429 | `rate_limit_exceeded` | Transient rate limit | Retry with backoff (the `openai` SDK does this automatically) |
 | 503 | `server_overloaded`, `codex_unavailable`, `session_limit` | Upstream overloaded, the Codex process died, or all 100 sessions are busy | Retry; for `codex_unavailable`, restart Conduix |
 | 500 / 502 | `server_error`, `upstream_error` | Codex failed during the turn | Retry once; if it persists, check server logs |
+| 502 | `no_image_generated` | Images API: the model answered without generating an image (the message carries what it said, e.g. a refusal). `x-should-retry: false` | Change the prompt |
 
 **While streaming**, a failure never drops the connection:
 
@@ -635,7 +729,10 @@ Errors use OpenAI's error envelope:
 | Tools together with `session_id` | 400 |
 | Legacy function calling (Chat Completions) | `function_call` / `role: "function"` messages return 400, and a `functions` parameter is ignored; use `tools` |
 | `https://` image URLs, `file_id` images | 400 |
-| Embeddings, audio, image generation, files, Assistants, batch | Not available |
+| Image generation options (`size`, `quality`, `background`, image `model`, ...) | Can't be enforced. Ignored on the Responses tool; the Images API passes `size` and `background` as a hint (§8) |
+| Images API `n` > 1, `response_format: "url"`, `stream: true` | 400 |
+| Image generation on Chat Completions or with `session_id` | 400 |
+| Embeddings, audio, image edits and variations (`/v1/images/edits`, ...), files, Assistants, batch | Not available |
 | Parallel requests on one session | Queued, one at a time |
 
 The model has **no access** to your files or shell, and no network access

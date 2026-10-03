@@ -46,8 +46,8 @@ class Session:
     # Created by /v1/responses for a request without session_id; hidden from
     # GET /v1/sessions but swept and capped like any other session.
     implicit: bool = False
-    # Identifies the thread's function tools + web search (fixed at thread
-    # start); a previous_response_id fast path needs the same.
+    # Identifies the thread's function tools, web search and image generation
+    # (fixed at thread start); a previous_response_id fast path needs the same.
     tools_key: str = ""
     # Last completed response on this thread; None once the thread holds a
     # turn that no stored response describes (failed turn, store=false).
@@ -93,12 +93,14 @@ class SessionManager:
         implicit: bool = False,
         tools: list[dict] | None = None,
         web_search: bool = False,
+        image_generation: bool = False,
         tools_key: str = "",
     ) -> Session:
         model = backend.resolve_model(model, effort)
         thread = await backend.start_thread(
             model=model, developer_instructions=instructions,
             **({"tools": tools} if tools else {}), **({"web_search": True} if web_search else {}),
+            **({"image_generation": True} if image_generation else {}),
         )
 
         # No awaits from here to the insert, so the cap check can't race.

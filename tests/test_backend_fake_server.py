@@ -200,7 +200,7 @@ def app_client(monkeypatch):
 
     fresh = Backend(launch_args=FAKE)
     for mod in ("conduix.app", "conduix.sessions", "conduix.routes.responses",
-                "conduix.routes.chat", "conduix.routes.models"):
+                "conduix.routes.chat", "conduix.routes.models", "conduix.routes.images"):
         monkeypatch.setattr(f"{mod}.backend", fresh)
     mgr = SessionManager()
     for mod in ("conduix.app", "conduix.routes.responses", "conduix.routes.sessions"):

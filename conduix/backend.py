@@ -15,6 +15,7 @@ import os
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from openai_codex import (  # noqa: F401 - error types re-exported for errors.py
@@ -42,13 +43,14 @@ BASE_INSTRUCTIONS = (
 )
 
 
-def base_instructions(*, tools: bool = False, web_search: bool = False) -> str:
+def base_instructions(*, tools: bool = False, web_search: bool = False,
+                      image_generation: bool = False) -> str:
     """The chat-only persona, telling the model which tools it really has.
 
     Found live: with BASE_INSTRUCTIONS ("You have no tools") the model refuses
     to call declared functions, so a thread with tools needs its own wording.
     """
-    if not tools and not web_search:
+    if not tools and not web_search and not image_generation:
         return BASE_INSTRUCTIONS
     parts = ["You are a helpful assistant answering over a chat API. "
              "You have no shell and no filesystem."]
@@ -56,6 +58,8 @@ def base_instructions(*, tools: bool = False, web_search: bool = False) -> str:
         parts.append("Call the provided functions when they help answer.")
     if web_search:
         parts.append("You can search the web; cite the sources you use.")
+    if image_generation:
+        parts.append("You can generate images.")
     return " ".join(parts)
 
 # Every agentic feature Codex 0.157 turns on by default. Accepted without
@@ -82,13 +86,13 @@ CHAT_ONLY_CONFIG: dict[str, Any] = {
 API_KEY_VARS = ("OPENAI_API_KEY", "CODEX_API_KEY")
 
 # Item types that mean Codex acted as an agent. With CHAT_ONLY_CONFIG they
-# should never appear; if one does, it is logged and dropped. (`webSearch` is
-# allowed only on turns that asked for it; `dynamicToolCall` items mirror the
-# client's own function calls, which arrive as ToolCall events instead.)
+# should never appear; if one does, it is logged and dropped. (`webSearch` and
+# `imageGeneration` are allowed only on turns that asked for them;
+# `dynamicToolCall` items mirror the client's own function calls, which arrive
+# as ToolCall events instead.)
 AGENTIC_ITEM_TYPES = frozenset({
     "commandExecution", "fileChange", "mcpToolCall",
-    "collabAgentToolCall", "subAgentActivity", "imageView",
-    "imageGeneration", "sleep",
+    "collabAgentToolCall", "subAgentActivity", "imageView", "sleep",
 })
 
 # `item/tool/call` server requests are re-routed into their turn's
@@ -217,6 +221,23 @@ class WebSearchCall:
 
 
 @dataclass(frozen=True, slots=True)
+class ImageGenerationCall:
+    """Codex's built-in image generation. Found live (step 13): one
+    `imageGeneration` item, started with an empty result and completed about
+    20 s later with the whole image. There are no partial images."""
+    item_id: str
+    status: str  # "in_progress" | "completed" | "failed"
+    result: str = ""  # the image as base64 (PNG), once completed
+    revised_prompt: str | None = None
+    transparent_background: bool | None = None
+    # Codex also writes the image under ~/.codex/generated_images; run_turn
+    # deletes that copy.
+    saved_path: str | None = None
+    limit_exceeded: bool = False  # failed on a usage limit (`usageLimitExceeded`)
+    resets_at: int | None = None  # when that limit resets (unix seconds), if known
+
+
+@dataclass(frozen=True, slots=True)
 class BlockedItem:
     """Codex started an agentic item (shell, file edit, tool call) despite
     chat-only mode. run_turn counts and drops it; it never reaches clients."""
@@ -232,7 +253,7 @@ class TurnDone:
 Event = (
     MessageStarted | TextDelta | MessageDone
     | ReasoningStarted | ReasoningSummaryDelta | ReasoningDone
-    | ToolCall | WebSearchCall
+    | ToolCall | WebSearchCall | ImageGenerationCall
     | Usage | TurnError | TurnDone
 )
 
@@ -280,6 +301,20 @@ def map_notification(method: str, payload: dict[str, Any]) -> list[Event]:
         if kind == "webSearch":
             return [WebSearchCall(item_id, "in_progress" if started else "completed",
                                   dict(item.get("action") or {}))]
+        if kind == "imageGeneration":
+            if started:
+                return [ImageGenerationCall(item_id, "in_progress")]
+            failure = item.get("failure") or {}
+            ok = bool(item.get("result")) and not failure
+            return [ImageGenerationCall(
+                item_id, "completed" if ok else "failed",
+                result=item["result"] if ok else "",
+                revised_prompt=item.get("revised_prompt"),
+                transparent_background=item.get("transparent_background"),
+                saved_path=item.get("saved_path"),
+                limit_exceeded=failure.get("type") == "usageLimitExceeded",
+                resets_at=failure.get("resets_at"),
+            )]
         if kind in AGENTIC_ITEM_TYPES and started:
             return [BlockedItem(kind)]
         return []
@@ -326,6 +361,30 @@ def _dump(obj: Any) -> dict[str, Any]:
         return obj.model_dump(mode="json", exclude_none=True, warnings=False)
     params = getattr(obj, "params", None)  # UnknownNotification
     return params if isinstance(params, dict) else {}
+
+
+def discard_saved_image(path: str | None) -> None:
+    """Delete Codex's on-disk copy of a generated image. Best effort.
+
+    The client gets the image in the response, so nothing would read the
+    file again. Only `<codex home>/generated_images/<thread>/<item>` is
+    touched.
+    """
+    if not path:
+        return
+    file = Path(path)
+    if file.parent.parent.name != "generated_images":
+        log.warning("left a generated image where it was, in an unexpected place: %s", path)
+        return
+    try:
+        file.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning("could not remove generated image %s: %s", path, e)
+        return
+    try:
+        file.parent.rmdir()  # the thread's folder, once it is empty
+    except OSError:
+        pass  # it still holds another image of this thread
 
 
 def scrub_api_keys() -> list[str]:
@@ -608,22 +667,27 @@ class Backend:
         ephemeral: bool = True,
         tools: list[dict[str, Any]] | None = None,
         web_search: bool = False,
+        image_generation: bool = False,
     ) -> AsyncThread:
         """Start a chat-only thread.
 
         `tools` are Codex dynamic tool specs ({type: "function", name,
         description, inputSchema}); they are fixed for the thread's life.
-        `web_search` turns Codex's own web search back on for this thread.
+        `web_search` and `image_generation` turn Codex's own web search and
+        image generation back on for this thread.
         """
         s = settings()
         config = dict(CHAT_ONLY_CONFIG)
         if web_search:
             config["web_search"] = s.web_search_mode
+        if image_generation:
+            config["features.image_generation"] = True
         kwargs = dict(
             approval_mode=ApprovalMode.deny_all,
             sandbox=Sandbox.read_only,
             cwd=str(s.workspace_dir),
-            base_instructions=base_instructions(tools=bool(tools), web_search=web_search),
+            base_instructions=base_instructions(tools=bool(tools), web_search=web_search,
+                                                image_generation=image_generation),
             developer_instructions=developer_instructions or s.default_instructions,
             ephemeral=ephemeral,
             model=model or s.default_model,
@@ -658,6 +722,7 @@ class Backend:
         summary: str | None = None,
         output_schema: dict[str, Any] | None = None,
         allow_web_search: bool = False,
+        allow_image_generation: bool = False,
     ) -> AsyncIterator[Event]:
         """Run one turn and yield its events, ending with TurnDone.
 
@@ -677,6 +742,12 @@ class Backend:
                 for ev in map_notification(n.method, _dump(n.payload)):
                     if isinstance(ev, WebSearchCall) and not allow_web_search:
                         ev = BlockedItem("webSearch")
+                    if isinstance(ev, ImageGenerationCall):
+                        discard_saved_image(ev.saved_path)
+                        if not allow_image_generation:
+                            if ev.status != "in_progress":
+                                continue  # counted once, when it started
+                            ev = BlockedItem("imageGeneration")
                     if isinstance(ev, BlockedItem):
                         self.blocked_items[ev.kind] = self.blocked_items.get(ev.kind, 0) + 1
                         log.warning("codex started a %s item despite chat-only mode; dropped",

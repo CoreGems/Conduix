@@ -12,6 +12,7 @@ from conduix import errors
 from conduix.backend import backend
 from conduix.config import settings
 from conduix.routes.chat import router as chat_router
+from conduix.routes.images import router as images_router
 from conduix.routes.models import router as models_router
 from conduix.routes.responses import router as responses_router
 from conduix.routes.sessions import router as sessions_router
@@ -41,6 +42,7 @@ app = FastAPI(
 errors.install(app)
 app.include_router(responses_router)
 app.include_router(chat_router)
+app.include_router(images_router)
 app.include_router(models_router)
 app.include_router(sessions_router)
 

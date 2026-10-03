@@ -16,6 +16,7 @@ from openai_codex import TransportClosedError
 from conduix import sessions as sessions_mod
 from conduix.app import app
 from conduix.backend import (
+    ImageGenerationCall,
     MessageDone,
     MessageStarted,
     TextDelta,
@@ -28,18 +29,24 @@ from conduix.backend import (
     WebSearchCall,
 )
 from conduix.responses_store import ResponseStore
+from conduix.routes import images as images_mod
 from conduix.routes import models as models_mod
 from conduix.routes import responses as responses_mod
 from conduix.routes import sessions as routes_sessions_mod
 from conduix.sessions import SessionManager
 
 
+# What the fake image tool "generates": a 1x1 PNG, base64.
+PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+
+
 class FakeThread:
-    def __init__(self, tid, instructions, tools=None, web_search=False):
+    def __init__(self, tid, instructions, tools=None, web_search=False, image_generation=False):
         self.id = tid
         self.instructions = instructions
         self.tools = tools or []
         self.web_search = web_search
+        self.image_generation = image_generation
         self.interrupted = False
         self.items = []  # (role, text)
 
@@ -73,8 +80,9 @@ class FakeBackend:
     ]
 
     async def start_thread(self, *, model=None, developer_instructions=None, tools=None,
-                           web_search=False):
-        t = FakeThread(f"thr_{len(self.threads)}", developer_instructions, tools, web_search)
+                           web_search=False, image_generation=False):
+        t = FakeThread(f"thr_{len(self.threads)}", developer_instructions, tools, web_search,
+                       image_generation)
         self.threads.append(t)
         return t
 
@@ -110,6 +118,18 @@ class FakeBackend:
         if "SEARCH" in texts and kw.get("allow_web_search"):
             yield WebSearchCall("ws_1", "in_progress", {"type": "search", "query": "q"})
             yield WebSearchCall("ws_1", "completed", {"type": "openPage", "url": "https://x.test"})
+        if kw.get("allow_image_generation") and any(t.startswith("IMAGE") for t in texts):
+            image_id = f"ig_{len(self.turns)}"
+            thread.interrupted = True  # unless the consumer stays for the rest of the turn
+            yield ImageGenerationCall(image_id, "in_progress")
+            if any(t.startswith("IMAGELIMIT") for t in texts):
+                yield ImageGenerationCall(image_id, "failed", limit_exceeded=True,
+                                          resets_at=int(time.time()) + 3600)
+            else:
+                thread.items.append(("image", image_id))
+                yield ImageGenerationCall(image_id, "completed", PNG_B64,
+                                          revised_prompt="A dot.", transparent_background=False)
+            thread.interrupted = False
         if "QUOTA" in texts:
             yield TurnError("You've hit your usage limit.", "usageLimitExceeded",
                             resets_at=int(time.time()) + 3600)
@@ -138,6 +158,7 @@ def fb(monkeypatch):
     monkeypatch.setattr(sessions_mod, "backend", fb)
     monkeypatch.setattr(responses_mod, "backend", fb)
     monkeypatch.setattr(models_mod, "backend", fb)
+    monkeypatch.setattr(images_mod, "backend", fb)
     monkeypatch.setattr(responses_mod, "manager", mgr)
     monkeypatch.setattr(routes_sessions_mod, "manager", mgr)
     monkeypatch.setattr(responses_mod, "store", ResponseStore())
@@ -187,7 +208,8 @@ def test_effort_summary_and_schema_reach_codex(client, fb):
         text={"format": {"type": "json_schema", "name": "x", "schema": schema}},
     )
     assert fb.turns[-1] == {"model": "gpt-6-sol", "effort": "high", "summary": "auto",
-                            "output_schema": schema, "allow_web_search": False}
+                            "output_schema": schema, "allow_web_search": False,
+                            "allow_image_generation": False}
     assert r.reasoning.effort == "high"
 
 

@@ -22,6 +22,9 @@ Turns answer with a dump of the thread's model-visible history
     APPROVE   ask for a command approval (`item/commandExecution/requestApproval`)
     WEIRD     send a server request the client can't know
     SEARCH    run a webSearch item (only if the thread enabled web_search)
+    IMAGE     run an imageGeneration item (only if the thread enabled
+              features.image_generation); the image is also written to disk,
+              as Codex does. IMAGELIMIT fails it on a usage limit instead
     TWICE     two model calls: two thread/tokenUsage/updated notifications
 
 `fake/stats` returns what the server saw, for assertions. Environment:
@@ -29,9 +32,11 @@ FAKE_ACCOUNT=none makes account/read report no login.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -39,6 +44,10 @@ from pathlib import Path
 
 FIXTURES = json.loads(
     (Path(__file__).parent / "fixtures" / "app_server_responses.json").read_text(encoding="utf-8"))
+
+# A 1x1 PNG, and where this fake "Codex home" keeps generated images.
+FAKE_IMAGE = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+GENERATED_IMAGES = Path(tempfile.gettempdir()) / "conduix_fake_codex" / "generated_images"
 
 out_lock = threading.Lock()
 threads: dict[str, dict] = {}
@@ -122,6 +131,21 @@ def run_turn(thread_id: str, turn_id: str, input_items: list[dict]) -> None:
         notify("item/started", {**base, "item": ws, "startedAtMs": now_ms()})
         done = {**ws, "action": {"type": "openPage", "url": "https://www.python.org/"}}
         notify("item/completed", {**base, "item": done, "completedAtMs": now_ms()})
+    if "IMAGE" in joined and th["image_generation"]:
+        ig = {"type": "imageGeneration", "id": f"exec-{turn_id}", "status": "in_progress",
+              "result": ""}
+        notify("item/started", {**base, "item": ig, "startedAtMs": now_ms()})
+        if "IMAGELIMIT" in joined:
+            done = {**ig, "status": "failed", "failure": {
+                "type": "usageLimitExceeded", "limitId": "image_generation",
+                "resetsAt": 1791131515}}
+        else:
+            saved = GENERATED_IMAGES / thread_id / f"{ig['id']}.png"
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            saved.write_bytes(base64.b64decode(FAKE_IMAGE))
+            done = {**ig, "status": "completed", "result": FAKE_IMAGE, "revisedPrompt": "A dot.",
+                    "savedPath": str(saved), "transparentBackground": False}
+        notify("item/completed", {**base, "item": done, "completedAtMs": now_ms()})
     if "RETRY" in joined:
         notify("error", {**base, "error": {"message": "reconnecting..."}, "willRetry": True})
     if "TOOL" in joined:
@@ -178,7 +202,10 @@ def handle(method: str, params: dict) -> dict | None:
         threads[tid] = {"history": [], "cwd": params.get("cwd") or resp["cwd"],
                         "tools": params.get("dynamicTools") or [],
                         "web_search": (params.get("config") or {}).get("web_search") not in
-                        (None, "disabled"), "total": {}}
+                        (None, "disabled"),
+                        "image_generation": (params.get("config") or {}).get(
+                            "features.image_generation") is True,
+                        "total": {}}
         if params.get("developerInstructions"):
             threads[tid]["history"].append(("developer", params["developerInstructions"]))
         return resp

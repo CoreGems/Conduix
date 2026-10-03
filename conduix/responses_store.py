@@ -35,6 +35,9 @@ class StoredResponse:
     instructions: str | None
     created_at: float = field(default_factory=time.time)
     size: int = 0  # approximate bytes of text + image data, set by the store
+    # Images this response generated: image_generation_call id → data URL
+    # (the same string `items` holds), so a later request can name one by id.
+    images: dict[str, str] = field(default_factory=dict)
 
 
 class ResponseStore:
@@ -66,6 +69,13 @@ class ResponseStore:
         if rec is not None:
             self._data.move_to_end(rid)
         return rec
+
+    def image(self, image_id: str) -> str | None:
+        """The data URL of a generated image, by its image_generation_call id."""
+        for rec in reversed(self._data.values()):
+            if image_id in rec.images:
+                return rec.images[image_id]
+        return None
 
     def history(self, rid: str) -> list[dict[str, Any]]:
         """All items from the start of the chain through `rid`, oldest first.

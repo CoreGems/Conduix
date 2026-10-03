@@ -192,6 +192,20 @@ def from_turn_error(err: TurnError) -> APIError:
                     headers=headers)
 
 
+def image_limit_error(resets_at: int | None) -> APIError:
+    """An image generation call failed on a usage limit. The failure names
+    the limit and carries its own reset time. (The account reports a single
+    usage bucket, `codex`, so this is most likely the plan's usage window;
+    BRIEF.md §3.2.)"""
+    message = "ChatGPT plan usage limit reached while generating an image"
+    headers = {"x-should-retry": "false"}
+    if resets_at:
+        message += f" ({_reset_text(resets_at)})"
+        headers["retry-after"] = str(max(0, int(resets_at - time.time())))
+    return APIError(USAGE_LIMIT.status, message, type=USAGE_LIMIT.type, code=USAGE_LIMIT.code,
+                    headers=headers)
+
+
 def from_exception(exc: BaseException) -> APIError:
     """An exception from the SDK / app-server (not a failed turn)."""
     if isinstance(exc, APIError):

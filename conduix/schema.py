@@ -10,6 +10,7 @@ import base64
 import binascii
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -55,6 +56,7 @@ ROLES = ("user", "assistant", "system", "developer")
 class Msg:
     role: str  # user | assistant | developer ("system" is folded into developer)
     parts: list[str | ImagePart]  # text and images, in order
+    generated: bool = False  # an image the model generated earlier (generated_image)
 
     @property
     def has_images(self) -> bool:
@@ -132,6 +134,41 @@ def _image(url: Any) -> ImagePart:
     return ImagePart(url)
 
 
+def image_info(b64: str) -> tuple[str, str | None]:
+    """(format, "WIDTHxHEIGHT" or None) of a base64 image, read from its header.
+
+    The format is OpenAI's `output_format` name: png, jpeg or webp. Codex
+    generates PNG (found live); the size is only read for PNG.
+    """
+    try:
+        head = base64.b64decode(b64[:32])
+    except (binascii.Error, ValueError):
+        return "png", None
+    if head.startswith(b"\x89PNG\r\n\x1a\n") and len(head) >= 24:
+        width, height = int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+        return "png", f"{width}x{height}"
+    if head.startswith(b"\xff\xd8"):
+        return "jpeg", None
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "webp", None
+    return "png", None
+
+
+# How an image the model generated earlier is replayed to it. Found live
+# (step 13): `thread/inject_items` accepts an image_generation_call item, but
+# the model then doesn't see the image. A user message carrying it does work.
+GENERATED_IMAGE_NOTE = "[The assistant generated this image]"
+
+
+def image_data_url(result: str) -> str:
+    """A generated image (`image_generation_call.result`, base64) as a data URL."""
+    return f"data:image/{image_info(result)[0]};base64,{result}"
+
+
+def generated_image(url: str) -> Msg:
+    return Msg("user", [GENERATED_IMAGE_NOTE, ImagePart(url)], generated=True)
+
+
 def _parts(content: Any) -> list[str | ImagePart]:
     if isinstance(content, str):
         return [content]
@@ -169,13 +206,16 @@ def _tool_output(output: Any) -> str | list[dict[str, Any]]:
     return parts
 
 
-def parse_input(input: str | list[dict[str, Any]]) -> list[Item]:
+def parse_input(input: str | list[dict[str, Any]],
+                find_image: Callable[[str], str | None] | None = None) -> list[Item]:
     """Normalize Responses `input` to messages and function-call items.
 
     Accepts a string, easy messages ({role, content}), `message` items,
     `function_call` / `function_call_output` items, and items copied from an
     earlier response's `output` (reasoning and web_search_call items there are
-    dropped: they can't be replayed).
+    dropped: they can't be replayed). An `image_generation_call` item carries
+    its image in `result`, or names an earlier one by `id`: `find_image`
+    then returns that image's data URL, or None.
     """
     if isinstance(input, str):
         return [Msg("user", [input])]
@@ -183,6 +223,22 @@ def parse_input(input: str | list[dict[str, Any]]) -> list[Item]:
     for item in input:
         kind = item.get("type", "message")
         if kind in ("reasoning", "web_search_call"):
+            continue
+        if kind == "image_generation_call":
+            result, image_id = item.get("result"), item.get("id")
+            if result:
+                if not isinstance(result, str):
+                    raise _bad("image_generation_call.result must be a base64 string")
+                url = _image(image_data_url(result)).url
+            elif item.get("status") == "failed":
+                continue  # copied from an earlier output; there is no image to replay
+            else:
+                url = find_image(image_id) if find_image and isinstance(image_id, str) else None
+                if url is None:
+                    raise _bad(f"image_generation_call {image_id!r} not found (expired, not "
+                               "stored, or server restarted); send the item with its result",
+                               "image_not_found")
+            msgs.append(generated_image(url))
             continue
         if kind == "function_call":
             args = item.get("arguments", "")
@@ -202,6 +258,8 @@ def parse_input(input: str | list[dict[str, Any]]) -> list[Item]:
         msg = Msg("developer" if role == "system" else role, _parts(item.get("content")))
         if msg.has_images and msg.role != "user":
             raise _bad("only user messages can contain images")
+        if msg.role == "assistant" and not any(msg.parts):
+            continue  # the model's empty closing message after an image; nothing to replay
         msgs.append(msg)
     return msgs
 
@@ -209,12 +267,23 @@ def parse_input(input: str | list[dict[str, Any]]) -> list[Item]:
 def split_turn(msgs: list[Item]) -> tuple[list[Item], list[Msg]]:
     """(history to inject, new turn): the new turn is the trailing user
     messages. It may be empty when the input ends with function call output:
-    the model then continues from the tool results."""
-    i = len(msgs)
-    while i > 0 and isinstance(msgs[i - 1], Msg) and msgs[i - 1].role == "user":
+    the model then continues from the tool results.
+
+    A generated image is history, and ends the run of user messages before
+    it. Only images listed after the last user message (OpenAI's "edit this
+    one" form) belong to the new turn."""
+    def user(m: Item, generated: bool) -> bool:
+        return isinstance(m, Msg) and m.role == "user" and m.generated == generated
+
+    end = len(msgs)
+    while end > 0 and user(msgs[end - 1], True):
+        end -= 1
+    i = end
+    while i > 0 and user(msgs[i - 1], False):
         i -= 1
-    if i == len(msgs) and not isinstance(msgs[-1] if msgs else None, FunctionOutput):
-        raise _bad("input must end with a user message or function_call_output")
+    if i == end:  # no user message
+        if end < len(msgs) or not isinstance(msgs[-1] if msgs else None, FunctionOutput):
+            raise _bad("input must end with a user message or function_call_output")
     return msgs[:i], msgs[i:]
 
 
@@ -224,16 +293,19 @@ _NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def parse_tools(tools: list[dict[str, Any]] | None, tool_choice: Any = None,
-                ) -> tuple[list[dict[str, Any]], bool]:
-    """Responses `tools` → (Codex dynamic tool specs, web_search enabled).
+                ) -> tuple[list[dict[str, Any]], bool, bool]:
+    """Responses `tools` → (Codex dynamic tool specs, web_search enabled,
+    image_generation enabled).
 
-    `tool_choice: "none"` drops every tool. "required" or a specific function
-    can't be enforced through Codex, so they are treated as "auto".
+    `tool_choice: "none"` drops every tool. "required" or a specific tool
+    can't be enforced through Codex, so they are treated as "auto". The
+    image_generation tool's options (size, quality, ...) are ignored: Codex's
+    model writes the image request itself.
     """
     if tool_choice == "none" or not tools:
-        return [], False
+        return [], False, False
     specs: list[dict[str, Any]] = []
-    web_search = False
+    web_search = image_generation = False
     for i, tool in enumerate(tools):
         kind = tool.get("type")
         if kind == "function":
@@ -248,10 +320,12 @@ def parse_tools(tools: list[dict[str, Any]] | None, tool_choice: Any = None,
                           "description": tool.get("description") or "", "inputSchema": params})
         elif isinstance(kind, str) and kind.startswith("web_search"):
             web_search = True
+        elif kind == "image_generation":
+            image_generation = True
         else:
-            raise APIError(400, f"tool type {kind!r} is not supported; use function or "
-                           "web_search", param=f"tools[{i}].type")
-    return specs, web_search
+            raise APIError(400, f"tool type {kind!r} is not supported; use function, "
+                           "web_search or image_generation", param=f"tools[{i}].type")
+    return specs, web_search, image_generation
 
 
 def check_tool_outputs(items: list[Item], history: list[dict[str, Any]] = ()) -> None:

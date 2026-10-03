@@ -32,12 +32,17 @@ Rust via `reqwest` + SSE.
    When the field is omitted, requests are stateless like the real API.
 5. **Legible failures.** When the plan quota runs out, return a clean 429 with
    the reset time, as Conduit does. Never return an empty 200.
+6. **Image generation** (added in v1.2). Generate images on the subscription
+   through Codex's built-in image tool, in OpenAI's shapes: the
+   `image_generation` tool on `/v1/responses`, and `/v1/images/generations`.
+   It is off unless a request asks for it, like web search.
 
 ## Non-goals (v1)
 
 - Being a general coding agent. Codex's own shell, file-edit, and patch tools
   are **disabled**, so Conduix behaves like a plain model endpoint.
-- Embeddings, audio, images/generations, fine-tuning, the Assistants API.
+- Embeddings, audio, fine-tuning, the Assistants API, and the other Images
+  endpoints (`/v1/images/edits`, `/v1/images/variations`).
 - Exposing it on a network or supporting more than one user.
 - Automatic Claude↔Codex failover. That idea lives in Conduit's
   `CODEX_INTEGRATION_HOWTO.md`. Conduix is the standalone half it would build on.
@@ -50,6 +55,7 @@ Rust via `reqwest` + SSE.
 | ------ | ----------------------- | ---------------------------------------------------- |
 | POST   | `/v1/responses`         | OpenAI Responses API (primary; closest to Codex's own model). Optional `session_id`. |
 | POST   | `/v1/chat/completions`  | OpenAI Chat Completions (compat layer over the same core). Optional `session_id`. |
+| POST   | `/v1/images/generations` | OpenAI Images API (a Responses turn with the image tool on, §3.2) |
 | GET    | `/v1/models`            | Models the logged-in plan can use (from the Codex model list). |
 | GET    | `/v1/sessions`          | List active sessions                                 |
 | POST   | `/v1/sessions`          | Create empty session → `{session_id}`                |
@@ -152,7 +158,7 @@ Every thread starts with the following settings pinned. They are passed as
   `browser_use`, `computer_use`, `image_generation`, `sleep_tool`,
   `tool_suggest`, `skill_search`, `goals`, `hooks`. The canonical copy lives in
   `scripts/probe_sdk.py` (`CHAT_ONLY_CONFIG`). Web search gets turned back on
-  per request in v1.1.
+  per request in v1.1, and image generation in v1.2.
 - `ephemeral=True` for stateless requests, so the throwaway threads don't pile
   up in Codex's thread store.
 - `base_instructions=` a minimal assistant prompt, so there is no coding-agent
@@ -251,6 +257,51 @@ developer roles) to a thread's model-visible history. Checked live: an
 injected assistant turn was recalled. Stateless replay and
 `previous_response_id` rebuilds use it instead of flattening history to text.
 
+### 3.2 Image generation findings (step 13, 2026-10-03, SDK 0.157.1)
+
+Source: `scripts/probe_image_gen.py` (log in `scratch/probe_image_*.jsonl`),
+then live runs through the server.
+
+- **It works on the Plus plan.** `modelProvider/capabilities/read` reports
+  `image_generation: true`. A thread started with
+  `features.image_generation=True` (everything else still locked down)
+  generates images; the read-only sandbox doesn't get in the way.
+- **One item, no partial images.** `item/started` for `type:
+  "imageGeneration"` (`status: "in_progress"`, `result: ""`), then
+  `item/completed` about 20 s later with `result` (the whole image as base64
+  PNG, about 0.7 MB for a simple one), `revised_prompt`,
+  `transparent_background` and `saved_path`. After it the model makes a
+  second call and closes with an **empty** `agentMessage`.
+- **Codex writes its own copy to disk**, outside the workspace:
+  `~/.codex/generated_images/<thread>/<item>.png`. Conduix deletes it as soon
+  as the item completes. Checked live: the thread carries on fine without it.
+- **The image is fed back to the model** (the second model call has about
+  2.2k more input tokens), so a follow-up on the same thread sees it.
+- **Replaying an image on a new thread:** `thread/inject_items` accepts an
+  `image_generation_call` item, but the model then **doesn't see the
+  image** (found live, with the feature on or off). A user message with a
+  short note and the image as `input_image` does work, so that is how a
+  generated image is replayed.
+- **Edits work.** Given an earlier image and "make the square red", the tool
+  ran as an edit of the provided image (its `revised_prompt` said so), and
+  the result kept the layout.
+- **Size can be asked for.** A size in the prompt was honoured
+  (`1536x1024` came back as exactly that); with no size the image was
+  1254x1254. The model writes the tool call itself, so size, quality and
+  background can't be enforced.
+- **Failure shape (not seen live):** the item carries `failure: {type:
+  "usageLimitExceeded", limitId, resetsAt}`. That is the SDK's type, and the
+  Codex binary serializes the same thing (`ImageGenerationFailure::
+  UsageLimitExceeded`, an internally tagged enum with `limitId` and
+  `resetsAt`).
+- **Which limit it is.** `account/rateLimits/read` reports a single bucket
+  for this account, `codex` (the weekly window on `/health`), and no image
+  bucket. Its `used_percent` went from 2 to 4 over this step's 8 images and
+  about 16 text turns, so images draw on the plan's ordinary usage limit.
+  Reaching it on purpose would use up the week's quota, so the
+  failure has only been tested offline (`tests/test_image_generation.py`,
+  through the real SDK against the fake app-server).
+
 ---
 
 ## 4. Feature map (v1 target)
@@ -266,6 +317,7 @@ injected assistant turn was recalled. Stateless replay and
 | Usage (`input_tokens`, `output_tokens`, `reasoning_tokens`, cached) | ✅ | Taken from `thread/tokenUsage/updated` → `token_usage.last`. Every OpenAI usage field has a direct source (§3.1). |
 | Custom function tools (client-executed)   | ✅ v1.1 | Codex dynamic tools; on a call the response ends with `function_call` and the turn is interrupted; `function_call_output` resumes on a rebuilt thread (§7, verified live 2026-09-27) |
 | Hosted `web_search`                       | ✅ v1.1 | `tools: [{"type": "web_search"}]` / chat `web_search_options` turn Codex's web search on for that thread (`CONDUIX_WEB_SEARCH_MODE`, default `live`); `web_search_call` output items |
+| Image generation (`image_generation` tool, `/v1/images/generations`) | ✅ v1.2 | `tools: [{"type": "image_generation"}]` turns Codex's image tool on for that thread; `image_generation_call` output items with the PNG in `result`. Earlier images are replayed as a user image message (§3.2). `/v1/images/generations` runs the same turn and stops it once the image is in. Not on Chat Completions (no image output shape) or with `session_id`. Tool options are ignored; the images endpoint passes `size` / `background` as a hint |
 | `temperature`, `top_p`, `stop`, `max_output_tokens` | ⚠️ | Accepted. Applied where Codex supports them, otherwise ignored, and the docs list which |
 | Structured outputs (`text.format` json_schema) | ✅ | Passed as the turn's `output_schema`; verified live 2026-09-27. Upstream only accepts strict schemas, and a schema allowing only `{}` never finishes (found live), so it gets a 400 |
 | JSON mode (`json_object`)                 | ✅ | Can't be a schema (no strict "any object"), so it's an instruction on that turn only, plus code-fence stripping done while streaming (`json_safe_prefix`: only an undecided opening fence and a trailing run of backticks/whitespace are held back). Verified live on both endpoints; not guaranteed like json_schema |
@@ -291,10 +343,11 @@ conduix/
   errors.py         quota / auth / upstream → OpenAI error envelope
   routes/responses.py
   routes/chat.py
+  routes/images.py
   routes/models.py
   routes/sessions.py
 tests/              unit (offline, fake backend) + integration (-m integration)
-scripts/            probe_sdk.py (step 2) + demos: inference, multiturn, image, effort
+scripts/            probe_sdk.py (step 2), probe_image_gen.py (step 13) + demos: inference, multiturn, image, effort
 scratch/            local probe logs (gitignored)
 plan/               step-by-step build plan, same style as Conduit's plan/
 start_app.ps1       kill (whole process tree) and restart on port
@@ -359,6 +412,10 @@ passes.
     raised if the app-server had died (SDK close() on Windows); fixed.
 12. ✅ **v1.1** (done 2026-09-27): custom function tools, web search. Verified live on both
     endpoints, incl. a two-round agent loop. Design in §7 ("Custom tools").
+13. ✅ **v1.2: image generation** (done 2026-10-03; goal 6, findings in §3.2). The
+    `image_generation` tool on `/v1/responses` (streaming included) and `/v1/images/generations`.
+    Verified live: an image through each, a follow-up on the same thread and on a rebuilt one,
+    and an edit of an earlier image named by its id.
 
 ### Acceptance for v1
 
@@ -430,6 +487,21 @@ tools through a prompt has no effect on disk.
   backend at all. If so, document them as advisory.
 - **Remote image URLs.** Codex has deprecated them upstream, so return a 400
   in v1 and accept data URLs only.
+- **Image generation** (step 13). Still open:
+  - A real usage-limit failure during image generation has not been
+    captured (§3.2). The mapping is built from the protocol types: on
+    `/v1/responses` the item comes back with `status: "failed"` and the turn
+    carries on; `/v1/images/generations` returns a 429 with the reset time.
+    Unconfirmed: the item's `status` and `result` when it fails, whether the
+    turn really continues or fails as a whole (then the ordinary quota path
+    answers with a 429), and whether `resetsAt` is always set.
+  - The tool's options (`size`, `quality`, `background`, `model`, ...) can't
+    be enforced, because the model writes the image request. They are
+    ignored on `/v1/responses`; `/v1/images/generations` passes `size` and
+    `background` to the model as a hint.
+  - After an image the model's closing message is empty, so the response
+    ends with a `message` item whose text is `""`. It is kept in the output
+    and left out of the history (stored or resent).
 - **Quota signal.** *Mostly settled.* Classification uses Codex's own
   `codexErrorInfo` enum from the app-server protocol schema
   (`usageLimitExceeded`, `rateLimitExceeded`, ...), never message text, and the
