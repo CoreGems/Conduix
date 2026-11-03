@@ -17,6 +17,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict
 
 from conduix.backend import ImagePart
+from conduix.citations import Document, new_tag, parse_document
 from conduix.errors import APIError
 
 
@@ -55,19 +56,23 @@ ROLES = ("user", "assistant", "system", "developer")
 @dataclass
 class Msg:
     role: str  # user | assistant | developer ("system" is folded into developer)
-    parts: list[str | ImagePart]  # text and images, in order
+    parts: list[str | ImagePart | Document]  # text, images and documents, in order
     generated: bool = False  # an image the model generated earlier (generated_image)
 
     @property
     def has_images(self) -> bool:
         return any(isinstance(p, ImagePart) for p in self.parts)
 
+    @property
+    def documents(self) -> list[Document]:
+        return [p for p in self.parts if isinstance(p, Document)]
+
     def to_item(self) -> dict[str, Any]:
         """As a raw Responses API item, for `thread/inject_items`."""
         kind = "output_text" if self.role == "assistant" else "input_text"
         return {"type": "message", "role": self.role, "content": [
             {"type": "input_image", "image_url": p.url} if isinstance(p, ImagePart)
-            else {"type": kind, "text": p}
+            else {"type": kind, "text": p.render() if isinstance(p, Document) else p}
             for p in self.parts
         ]}
 
@@ -169,12 +174,13 @@ def generated_image(url: str) -> Msg:
     return Msg("user", [GENERATED_IMAGE_NOTE, ImagePart(url)], generated=True)
 
 
-def _parts(content: Any) -> list[str | ImagePart]:
+def _parts(content: Any) -> list[str | ImagePart | Document]:
+    """Content parts. Documents come back unnumbered; parse_input numbers them."""
     if isinstance(content, str):
         return [content]
     if not isinstance(content, list):
         raise _bad("message content must be a string or a list of content parts")
-    out: list[str | ImagePart] = []
+    out: list[str | ImagePart | Document] = []
     for part in content:
         kind = part.get("type") if isinstance(part, dict) else None
         if kind in ("input_text", "output_text", "text"):
@@ -189,6 +195,8 @@ def _parts(content: Any) -> list[str | ImagePart]:
         elif kind == "image_url":  # Chat: {"image_url": {"url": "data:..."}}
             ref = part.get("image_url")
             out.append(_image(ref.get("url") if isinstance(ref, dict) else ref))
+        elif kind == "x_document":  # Conduix extension: citable inline text
+            out.append(parse_document(part))
         else:
             raise _bad(f"content part type {kind!r} is not supported")
     return out
@@ -201,6 +209,8 @@ def _tool_output(output: Any) -> str | list[dict[str, Any]]:
         raise _bad("function_call_output.output must be a string or a list of content parts")
     parts: list[dict[str, Any]] = []
     for p in _parts(output):
+        if isinstance(p, Document):
+            raise _bad("x_document parts go in the newest user message, not in tool output")
         parts.append({"type": "input_image", "image_url": p.url} if isinstance(p, ImagePart)
                      else {"type": "input_text", "text": p})
     return parts
@@ -258,10 +268,22 @@ def parse_input(input: str | list[dict[str, Any]],
         msg = Msg("developer" if role == "system" else role, _parts(item.get("content")))
         if msg.has_images and msg.role != "user":
             raise _bad("only user messages can contain images")
+        if msg.documents and msg.role != "user":
+            raise _bad("only user messages can contain x_document parts", "invalid_document")
         if msg.role == "assistant" and not any(msg.parts):
             continue  # the model's empty closing message after an image; nothing to replay
         msgs.append(msg)
+    _number_documents(msgs)
     return msgs
+
+
+def _number_documents(msgs: list[Item]) -> None:
+    """Documents are numbered across the request in order (`document_index`)
+    and share one wrapper tag, fresh per request."""
+    tag = new_tag()
+    docs = [d for m in msgs if isinstance(m, Msg) for d in m.documents]
+    for i, d in enumerate(docs):
+        d.index, d.tag = i, tag
 
 
 def split_turn(msgs: list[Item]) -> tuple[list[Item], list[Msg]]:

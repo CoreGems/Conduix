@@ -19,6 +19,11 @@ A generated image is one image_generation_call item: output_item.added,
 response.image_generation_call.in_progress / .generating / .completed,
 output_item.done (with the image in `result`).
 
+With citable documents (Conduix extension, citations.py) the text runs
+through a CitationFilter: markers never reach the client, and each verified
+citation is a response.output_text.annotation.added event right after the
+text it supports. The final output_text part carries the same annotations.
+
 Chat Completions chunks (step 9) will be derived from the same events.
 """
 from __future__ import annotations
@@ -49,6 +54,7 @@ from conduix.backend import (
     WebSearchCall,
 )
 
+from conduix.citations import CitationFilter, Counts, Document
 from conduix.errors import resolve
 from conduix.schema import image_info
 
@@ -66,7 +72,9 @@ class _Message:
     phase: str | None
     text: str = ""
     done: bool = False
-    held: str = ""  # JSON mode: the raw text so far (what's sent is cleaned)
+    held: str = ""  # JSON mode or citations: the raw text so far (what's sent is cleaned)
+    annotations: list[dict[str, Any]] = field(default_factory=list)
+    citations: CitationFilter | None = None
 
 
 def _drop_opening_fence(raw: str) -> str | None:
@@ -148,6 +156,7 @@ class ResponseStream:
         text: dict[str, Any] | None = None,
         session_id: str | None = None,
         json_mode: bool = False,
+        documents: list[Document] | None = None,
     ) -> None:
         self.id = response_id or new_response_id()
         self.response: dict[str, Any] = {
@@ -176,6 +185,13 @@ class ResponseStream:
             self.response["session_id"] = session_id  # Conduix extension
         # JSON mode strips code fences as the text streams (json_safe_prefix).
         self.json_mode = json_mode
+        # Citable documents: markers are parsed out of the text as it streams.
+        self.documents = documents or []
+        self.citing = any(d.citations for d in self.documents)
+        # Set for a later turn on a thread that cited: markers are removed, and
+        # none can be verified (no documents on this request).
+        self.strip_markers = False
+        self.citation_counts = Counts()
         self._seq = 0
         self._items: dict[str, _Message | _Reasoning | _WebSearch | _ImageGeneration] = {}
         self.tool_calls: list[dict[str, Any]] = []  # function_call items, in order
@@ -205,7 +221,7 @@ class ResponseStream:
 
     @staticmethod
     def _message_item(m: _Message, status: str) -> dict[str, Any]:
-        content = [] if status == "in_progress" else [_text_part(m.text)]
+        content = [] if status == "in_progress" else [_text_part(m.text, m.annotations)]
         item = {"id": m.id, "type": "message", "role": "assistant",
                 "status": status, "content": content}
         if m.phase:
@@ -223,6 +239,8 @@ class ResponseStream:
 
     def _start_message(self, ev: MessageStarted) -> list[dict]:
         m = _Message(index=len(self.response["output"]), id=ev.item_id, phase=ev.phase)
+        if self.citing or self.strip_markers:
+            m.citations = CitationFilter(self.documents, self.citation_counts)
         self._items[m.id] = m
         item = self._message_item(m, "in_progress")
         self._add_item(item)
@@ -249,7 +267,7 @@ class ResponseStream:
             self._emit("response.output_text.done", item_id=m.id, output_index=m.index,
                        content_index=0, text=m.text, logprobs=[]),
             self._emit("response.content_part.done", item_id=m.id, output_index=m.index,
-                       content_index=0, part=_text_part(m.text)),
+                       content_index=0, part=_text_part(m.text, m.annotations)),
             self._emit("response.output_item.done", output_index=m.index, item=copy.deepcopy(item)),
         ]
         return out
@@ -258,6 +276,35 @@ class ResponseStream:
         m.text += delta
         return self._emit("response.output_text.delta", item_id=m.id, output_index=m.index,
                           content_index=0, delta=delta, logprobs=[])
+
+    def _cite(self, m: _Message, raw: str | None) -> list[dict]:
+        """Run raw text through the message's citation filter (None: the
+        message ended) and emit what comes out."""
+        assert m.citations is not None
+        out = []
+        if raw is not None:
+            m.held += raw
+        for piece in m.citations.feed(raw) if raw is not None else m.citations.finish():
+            if isinstance(piece, str):
+                out.append(self._text_delta(m, piece))
+                continue
+            m.annotations.append(piece)
+            out.append(self._emit("response.output_text.annotation.added", item_id=m.id,
+                                  output_index=m.index, content_index=0,
+                                  annotation_index=len(m.annotations) - 1,
+                                  annotation=copy.deepcopy(piece)))
+        return out
+
+    def _end_cited(self, m: _Message, final_text: str | None, status: str) -> list[dict]:
+        out = []
+        if final_text is not None:
+            if final_text.startswith(m.held):
+                out += self._cite(m, final_text[len(m.held):])  # never streamed
+            else:
+                log.warning("message %s: deltas differ from final text; keeping the streamed "
+                            "text (its citations were sent)", m.id)
+        out += self._cite(m, None)
+        return out + self._finish_message(m, None, status)
 
     def _start_reasoning(self, ev: ReasoningStarted) -> list[dict]:
         r = _Reasoning(index=len(self.response["output"]), id=ev.item_id)
@@ -411,6 +458,8 @@ class ResponseStream:
             if not isinstance(m, _Message):
                 out = self._start_message(MessageStarted(ev.item_id))
                 m = self._items[ev.item_id]
+            if m.citations is not None:
+                return out + self._cite(m, ev.delta)
             if self.json_mode:
                 m.held += ev.delta
                 safe = json_safe_prefix(m.held)
@@ -423,8 +472,11 @@ class ResponseStream:
             out = []
             if not isinstance(self._items.get(ev.item_id), _Message):
                 out = self._start_message(MessageStarted(ev.item_id))
+            m = self._items[ev.item_id]
+            if m.citations is not None:
+                return out + self._end_cited(m, ev.text, "completed")
             text = clean_json_text(ev.text) if self.json_mode else ev.text
-            return out + self._finish_message(self._items[ev.item_id], text, "completed")
+            return out + self._finish_message(m, text, "completed")
 
         if isinstance(ev, ReasoningSummaryDelta):
             r = self._items.get(ev.item_id)
@@ -476,7 +528,9 @@ class ResponseStream:
         for item in self._items.values():
             if item.done:
                 continue
-            if isinstance(item, _Message):
+            if isinstance(item, _Message) and item.citations is not None:
+                out += self._end_cited(item, None, "incomplete")
+            elif isinstance(item, _Message):
                 held = clean_json_text(item.held) if self.json_mode and item.held else None
                 out += self._finish_message(item, held, "incomplete")
             elif isinstance(item, _WebSearch):
@@ -487,6 +541,8 @@ class ResponseStream:
                 out += self._finish_reasoning(item, None)
 
         self.finished = True
+        if self.citing and self.response["usage"] is not None:
+            self.response["usage"]["x_citations"] = self.citation_counts.as_dict()
         if ev.status == "completed":
             self.response["status"] = "completed"
             self.response["completed_at"] = int(time.time())
@@ -525,8 +581,9 @@ def _web_action(action: dict[str, Any]) -> dict[str, Any]:
     return {"type": "search", "query": action.get("query") or ""}
 
 
-def _text_part(text: str) -> dict[str, Any]:
-    return {"type": "output_text", "text": text, "annotations": [], "logprobs": []}
+def _text_part(text: str, annotations: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    return {"type": "output_text", "text": text,
+            "annotations": copy.deepcopy(annotations or []), "logprobs": []}
 
 
 def _summary_part(text: str) -> dict[str, Any]:

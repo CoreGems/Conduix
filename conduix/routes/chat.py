@@ -165,7 +165,10 @@ async def create_chat_completion(req: ChatCompletionRequest):
         raise APIError(400, str(exc), param="reasoning_effort",
                        code="unsupported_value") from exc
     model = backend.model_name(p.model)
-    rs = ResponseStream(model=model, session_id=req.session_id, json_mode=p.json_mode)
+    # x_document citations: chat has no annotations, so it gets the clean text
+    # only (the markers are still stripped).
+    rs = ResponseStream(model=model, session_id=req.session_id, json_mode=p.json_mode,
+                        documents=p.documents)
     events = run_events(p, rs)
 
     if req.stream:

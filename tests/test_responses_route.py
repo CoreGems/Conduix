@@ -56,6 +56,8 @@ class FakeBackend:
         self.threads = []
         self.closed = []
         self.turns = []  # kwargs of each run_turn
+        self.inputs = []  # input of each run_turn
+        self.reply = None  # set to script the model's raw reply
 
     def resolve_model(self, model, effort=None):
         if model == "nope":
@@ -101,6 +103,7 @@ class FakeBackend:
 
     async def run_turn(self, thread, input, **kw):
         self.turns.append(kw)
+        self.inputs.append(input)
         texts = [p for p in input if isinstance(p, str)]
         thread.items += [("user", p if isinstance(p, str) else f"<image {len(p.url)}>")
                          for p in input]
@@ -142,10 +145,12 @@ class FakeBackend:
         reply = "ctx=" + ";".join(f"{r}:{t}" for r, t in thread.items)
         if "FENCED" in texts:
             reply = '```json\n{"a": 1}\n```'
+        if self.reply is not None:  # a test's scripted reply, streamed a character at a time
+            reply = self.reply
         thread.items.append(("assistant", reply))
         yield MessageStarted("msg_1", "final_answer")
-        yield TextDelta("msg_1", reply[:5])
-        yield TextDelta("msg_1", reply[5:])
+        for delta in ([reply[:5], reply[5:]] if self.reply is None else list(reply)):
+            yield TextDelta("msg_1", delta)
         yield MessageDone("msg_1", reply)
         yield Usage(100, 80, 5, 0)
         yield TurnDone("completed")

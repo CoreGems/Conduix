@@ -724,6 +724,7 @@ Errors use OpenAI's error envelope:
 | `text.format` / `response_format` `json_object` | Supported, but instructed rather than guaranteed (§9, "JSON mode") |
 | `tool_choice` `"required"` or a named function | Behaves like `"auto"` |
 | Web search citations | Markdown links in the text; no `url_citation` annotations |
+| `input_file` parts (documents as files) | 400. For citable text documents use the `x_document` extension (`docs/conduix/RAG_INTEGRATION.md` §2.0) |
 | Web search options (`search_context_size`, `user_location`) | Accepted and ignored |
 | Other hosted tools (file search, code interpreter, MCP, computer use) | 400 |
 | Tools together with `session_id` | 400 |

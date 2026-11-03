@@ -44,6 +44,7 @@ examples.
 | **Images** | Base64 data URLs (PNG / JPEG / GIF / WebP), remembered across turns | [§8](./CONDUIX_API_USEAGE_GUIDE.md#8-images) |
 | **Image generation** | `/v1/images/generations`, or `tools: [{"type": "image_generation"}]` on the Responses API. PNG as base64; follow-up edits work | [§8](./CONDUIX_API_USEAGE_GUIDE.md#generating-images) |
 | **Structured output** | `json_schema` (strict schemas) via `text.format` / `response_format`. JSON mode (`json_object`) also works: best effort, streamed token by token, with code fences stripped | [§9](./CONDUIX_API_USEAGE_GUIDE.md#9-structured-output-json-schema-and-json-mode) |
+| **Verified document citations** | `x_document` parts (Conduix extension): the answer streams with `x_document_citation` annotations whose quotes are checked against the documents, with UTF-16 offsets | [RAG §2.0](./docs/conduix/RAG_INTEGRATION.md#20-verified-citations-x_document-conduix-extension) |
 | **Function tools** | Client-executed function calling on both endpoints, streaming included | [§10](./CONDUIX_API_USEAGE_GUIDE.md#10-function-tools) |
 | **Web search** | `tools: [{"type": "web_search"}]`, or `web_search_options` in Chat Completions | [§11](./CONDUIX_API_USEAGE_GUIDE.md#11-web-search) |
 | **Usage** | OpenAI-style token counts; `/health` shows how much of the plan's usage window is used | [§12](./CONDUIX_API_USEAGE_GUIDE.md#12-usage-and-token-counts) |

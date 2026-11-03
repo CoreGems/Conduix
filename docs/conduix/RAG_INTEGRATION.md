@@ -2,10 +2,19 @@
 
 Client-side guide for the features a retrieval pipeline leans on, as served
 by Conduix: **document input**, **citations**, **reasoning effort** and
-**structured output**. Conduix speaks the OpenAI API, so the first two work
-differently from Conduit: OpenAI has no `document` block for inline text and
-no citation events over it. This guide says what to send instead, what comes
-back, and which conventions were verified live. Self-contained.
+**structured output**. Conduix speaks the OpenAI API, which has no `document`
+block for inline text and no citation events over it. Conduix adds both as an
+extension: `x_document` parts with verified `x_document_citation`
+annotations (§2.0). Plain OpenAI clients can use the conventions of §1 and
+§2.2–2.3 instead. Self-contained.
+
+> `x_document` citations were verified 2026-11-03 against a running Conduix
+> (`gpt-6-astra`, `reasoning.effort: low`). The §7 test vector of
+> `FOUNDERDESK_BRIEF.md` streamed in 4.4 s with two annotations, each right
+> after its sentence and each satisfying `text.slice(start, end) === cited_text`
+> in UTF-16. A Ukrainian document with an emoji got correct UTF-16 offsets, an
+> instruction planted in a document was ignored, and a question the document
+> didn't cover got an uncited answer.
 
 > Verified 2026-10-31 against a running Conduix (`openai-codex` 0.157.1,
 > `gpt-6-astra`, `reasoning.effort: low`, two short documents): the structured
@@ -20,8 +29,8 @@ back, and which conventions were verified live. Self-contained.
 
 | Question | Answer |
 |---|---|
-| Can I send retrieved passages as document blocks? | **Not as files.** An `input_file` part is a `400`. Send each passage as its own `input_text` part wrapped in a small header the model can cite by, followed by the question (§1). Works on every multi-turn mode and the model sees earlier turns' documents too. |
-| Do citations come back? | **Not natively.** `annotations` is always `[]`; there is no `citations_delta`. OpenAI's own API has no character-offset citations over inline text either. Two conventions, both verified live: inline `[n]` markers in streamed prose (§2.2), or a `json_schema` answer carrying `document_index` + an exact `quote` that you verify client-side (§2.3). |
+| Can I send retrieved passages as document blocks? | **Yes, as `x_document` parts** (Conduix extension, §2.0) in the newest user message. Not as files: an `input_file` part is a `400`. A plain OpenAI client can wrap each passage in an `input_text` part instead (§1). |
+| Do citations come back? | **Yes, with `x_document` and `citations: true`:** `x_document_citation` annotations with the document index, the exact `cited_text` and its UTF-16 offsets in the document. They are verified server-side and streamed as `response.output_text.annotation.added` right after the text they support (§2.0). Without the extension `annotations` is `[]`; use the conventions of §2.2–2.3. |
 | Does effort work? | **Yes, per request.** `reasoning.effort` on Responses, `reasoning_effort` on chat. Valid values differ per model; read `efforts` from `/v1/models`. A wrong one is a `400`. |
 | Does structured output work? | **Yes.** `text.format` `{"type": "json_schema", "schema": ...}` (strict schemas) returns one `output_text` whose text is the JSON document. `client.responses.parse(text_format=Model)` and `zodTextFormat` work unchanged. JSON mode (`json_object`) is instructed, not guaranteed (§4). |
 | Binding | **Nothing is session-bound.** Model, effort, `text.format` and tools are per request. Documents are per turn and travel with the conversation (§1.3). |
@@ -101,11 +110,112 @@ documents reach the model.
 
 ## 2. Citations
 
-### 2.1 What you do not get
+### 2.0 Verified citations: `x_document` (Conduix extension)
 
-- `output_text` parts always carry `"annotations": []`. Conduix never emits
-  `url_citation`, `file_citation` or `container_file_citation`, and there is no
-  streaming citation event. OpenAI's own API only annotates web-search and
+Send each retrieved window as an `x_document` content part in the newest user
+message, before the question:
+
+```json
+{"role": "user", "content": [
+  {"type": "x_document", "id": "doc-1", "title": "Ops update",
+   "context": "IN RANGE, dated 2026-03-14",
+   "text": "The warehouse moved to Tallinn in March. The lease runs to 2029.",
+   "citations": true},
+  {"type": "input_text", "text": "Where is the warehouse?"}
+]}
+```
+
+| Field | Notes |
+|---|---|
+| `text` | Required, a string. The model quotes from it; offsets refer to it. Treated as data: Conduix wraps it in a tag whose name is random per request, and tells the model never to follow instructions inside. |
+| `id`, `title`, `context` | Optional strings, shown to the model as attributes. `id` comes back as `document_id`. `context` holds labels the model must repeat, not infer. |
+| `citations` | `true` makes the document citable. `false` or absent: context only. Anthropic's `{"enabled": true}` is accepted too. |
+
+Order defines `document_index` (0-based, counting every `x_document` part,
+citable or not). `x_document` is rejected (`400`, `code: invalid_document`) in
+earlier messages, in non-user messages and in tool output; send earlier
+turns' documents as plain text. Citations together with a JSON `text.format`
+are a `400` (markers live in prose); context-only documents work with any
+format.
+
+**Response, non-streaming.** One `output_text` part per message, holding the
+whole answer. Each annotation gives both spans:
+
+```json
+{"type": "output_text", "text": "The warehouse is in Tallinn.", "annotations": [
+  {"type": "x_document_citation", "document_index": 0, "document_id": "doc-1",
+   "document_title": "Ops update",
+   "cited_text": "The warehouse moved to Tallinn in March.",
+   "start_char_index": 0, "end_char_index": 40,
+   "answer_start_index": 0, "answer_end_index": 28}]}
+```
+
+- `start_char_index` / `end_char_index`: the span **in the document's
+  `text`**, and `cited_text` is that slice, so
+  `text.slice(start_char_index, end_char_index) === cited_text`.
+- `answer_start_index` / `answer_end_index`: the span of the answer it
+  supports, from the previous citation (or the start) to this one. Citations
+  side by side share one span.
+- All offsets are **UTF-16 code units** (JavaScript string indices). In
+  Python, slice `s.encode("utf-16-le")[2*start:2*end].decode("utf-16-le")`.
+
+**Response, streaming.** The standard Responses event carries each citation,
+right after the text it supports and before the next sentence:
+
+```
+event: response.output_text.delta
+data: {"type":"response.output_text.delta", ..., "delta":"The warehouse is in Tallinn."}
+
+event: response.output_text.annotation.added
+data: {"type":"response.output_text.annotation.added", "item_id":"msg_...", "output_index":0,
+       "content_index":0, "annotation_index":0, "annotation":{"type":"x_document_citation", ...}}
+```
+
+`response.output_text.done` and `content_part.done` carry the clean text; the
+final `output_text` part carries every annotation.
+
+**Usage.** `usage.x_citations: {"emitted": 2, "dropped": 1}` whenever a
+document is citable.
+
+How it works: the model writes an inline marker after each claim. Conduix
+holds the text back from the marker's start until it closes, then checks the
+quote against the document's `text`. A quote must match exactly, or with
+whitespace runs, quote marks, dashes and surrounding ellipses matched loosely
+(`cited_text` is always the document's own spelling), and be at least 3
+characters long. Anything else is dropped and counted: out-of-range or
+non-citable indices, absent quotes, malformed or unterminated markers. The
+text you receive never contains marker syntax.
+
+Guarantees, tested in `tests/test_citations.py`:
+
+1. `0 <= document_index < number of x_document parts`, and the document is citable.
+2. `document.text.slice(start_char_index, end_char_index) === cited_text` (UTF-16).
+3. No annotation for a quote that isn't in its document; drops are counted.
+4. In a stream, an annotation follows the text it supports and precedes the next sentence's text.
+5. No marker syntax in the text, even for malformed or unterminated markers.
+6. An answer without citations ("The documents do not say.") is valid.
+
+Notes:
+
+- Python `openai` SDK: `responses.create` and `responses.stream` parse the
+  annotation (as an `AnnotationFileCitation` object carrying the extra
+  fields; read them as attributes or via `model_dump()`), with a pydantic
+  serializer warning. The TypeScript SDK passes it through untouched.
+- Chat Completions accepts `x_document` parts too, but has no annotations:
+  you get the clean text only.
+- Multi-turn: documents stay in the stored history (wrapped, as the model saw
+  them) and answers are stored without markers. A later turn on the same
+  thread strips any markers the model writes from memory but returns no
+  annotations; resend the documents to get citations. FounderDesk's pattern
+  (stateless, documents on the newest turn only) is the supported one.
+- The model sometimes quotes a whole transcript line, speaker label included
+  (`Olena: We decided ...`). That is still an exact span of the document.
+
+### 2.1 What you do not get without `x_document`
+
+- Without `x_document` parts, `output_text` parts carry `"annotations": []`.
+  Conduix never emits `url_citation`, `file_citation` or
+  `container_file_citation`. OpenAI's own API only annotates web-search and
   file-search results, so this is a limit of the wire format, not just of
   Conduix.
 - With the `web_search` tool the model cites its sources as **markdown links
@@ -198,8 +308,8 @@ documents; the second call runs with the warm thread via `previous_response_id`.
   Anything else was dropped by your verifier, never shown.
 - Every citation shown under convention B has a `quote` that is a substring of
   its document after whitespace normalisation.
-- `annotations` is `[]` on every `output_text` part, so a client that depends
-  on annotations is reading the wrong field.
+- Without `x_document`, `annotations` is `[]` on every `output_text` part, so
+  a client that depends on annotations must use §2.0.
 - An uncited answer is not an error. If the documents don't cover the
   question the model may answer from general knowledge; constrain it in
   `instructions` and treat "no citations" as a signal in your UI.
@@ -515,7 +625,7 @@ println!("{text}");
 ## 6. Pitfalls
 
 1. **`input_file` is a 400.** There is no file upload path; inline the text.
-2. **Don't wait for `annotations`.** They are always empty. Citations come from your instruction plus your verifier.
+2. **`annotations` need `x_document`.** Without it they are always empty, and citations come from your instruction plus your verifier.
 3. **Verify before you show.** Neither convention is enforced. Drop out-of-range markers and non-substring quotes, and count the drops so an eval can see them.
 4. **Keep the document order on the client.** `document_index` and `[n]` refer to the order you sent, including documents the model didn't use.
 5. **Strict schemas only.** `additionalProperties: false` everywhere and every property required; `strict: false` does not relax this. The SDK helpers get it right.
@@ -537,7 +647,8 @@ println!("{text}");
 - [ ] An `input_file` part gets `400 content part type 'input_file' is not supported`, proving the fallback to inline text is the right path.
 - [ ] `reasoning.effort` set from the model's `efforts`; an unsupported value is a `400 unsupported_value`.
 - [ ] A non-strict schema gets `400 invalid_json_schema`; a strict one returns parseable `output_text`.
-- [ ] `annotations` is `[]` and the client does not depend on it.
+- [ ] Without `x_document`, `annotations` is `[]` and the client does not depend on it.
+- [ ] With `x_document` and `citations: true`, every annotation satisfies `text.slice(start_char_index, end_char_index) === cited_text`, and the streamed text contains no `⟦` or `⟧`.
 
 ---
 

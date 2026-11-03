@@ -26,6 +26,8 @@ from typing import Any
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from conduix.backend import Event, ToolCall, TurnDone, backend
+from conduix import citations
+from conduix.citations import Document
 from conduix.errors import APIError, from_exception, from_turn_error, not_found
 from conduix.responses_store import StoredResponse, store
 from conduix.schema import (
@@ -64,6 +66,7 @@ class Plan:
     image_generation: bool = False
     tool_called: bool = False  # set when the turn ended on a function call
     json_mode: bool = False  # text.format json_object
+    documents: list[Document] = field(default_factory=list)  # x_document parts, in order
 
     @property
     def tools_key(self) -> str:
@@ -137,6 +140,11 @@ def plan(req: ResponseCreateRequest) -> Plan:
     model = backend.resolve_model(requested_model, effort)
     msgs = parse_input(req.input, lambda image_id: store.image(image_id))
     history, new = split_turn(msgs)
+    documents = [d for m in new if isinstance(m, Msg) for d in m.documents]
+    if any(isinstance(m, Msg) and m.documents for m in history):
+        raise APIError(400, "x_document parts are only accepted in the newest user message; "
+                       "send earlier turns' documents as plain text", param="input",
+                       code="invalid_document")
     if any(_has_images(m) for m in msgs) and not backend.supports_images(model):
         raise APIError(400, f"model {backend.model_name(model)!r} does not accept image input",
                        param="model", code="unsupported_value")
@@ -156,9 +164,14 @@ def plan(req: ResponseCreateRequest) -> Plan:
             )
     check_tool_outputs(msgs, store.history(prev.id) if prev else [])
     output_schema, json_mode = _output_schema(req.text)
+    if (output_schema is not None or json_mode) and any(d.citations for d in documents):
+        # Citation markers live in prose; a JSON answer has nowhere to put them.
+        raise APIError(400, "x_document citations can't be combined with a JSON text.format; "
+                       "set citations to false, or ask for text", param="text.format.type",
+                       code="unsupported_value")
     return Plan(req, model, effort, summary, output_schema, history, new, prev,
                 tools=tools, web_search=web_search, image_generation=image_generation,
-                json_mode=json_mode)
+                json_mode=json_mode, documents=documents)
 
 
 def _output_items(rs: ResponseStream) -> tuple[list[dict[str, Any]], dict[str, str]]:
@@ -186,7 +199,15 @@ async def _turn(
     already belongs to earlier stored responses; `own` is this request's."""
     await backend.inject_items(sess.thread, base + own)
     sess.head_response_id = None  # the thread is about to move on
-    turn_input = [part for m in p.new for part in m.parts]
+    turn_input = [part.render() if isinstance(part, Document) else part
+                  for m in p.new for part in m.parts]
+    if p.documents:
+        # On the turn, like the JSON hint: how to read the documents and cite them.
+        turn_input.insert(0, citations.instructions(p.documents))
+    if rs.citing:
+        sess.cited = True
+    elif sess.cited:
+        rs.strip_markers = True  # the model may keep citing from memory
     if p.json_mode:
         # On the turn, not the thread: later turns aren't held to JSON.
         turn_input.append(JSON_MODE_HINT)
@@ -292,6 +313,7 @@ async def create_response(req: ResponseCreateRequest):
         text=req.text,
         session_id=req.session_id,
         json_mode=p.json_mode,
+        documents=p.documents,
     )
     events = run_events(p, rs)
     if req.stream:

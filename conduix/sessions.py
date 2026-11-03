@@ -52,6 +52,9 @@ class Session:
     # Last completed response on this thread; None once the thread holds a
     # turn that no stored response describes (failed turn, store=false).
     head_response_id: str | None = None
+    # The thread has run a turn with citable x_documents: the model saw the
+    # marker rules and its own markers, so later turns strip markers too.
+    cited: bool = False
 
     @property
     def busy(self) -> bool:
