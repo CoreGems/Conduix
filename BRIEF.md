@@ -43,8 +43,9 @@ Rust via `reqwest` + SSE.
   are **disabled**, so Conduix behaves like a plain model endpoint.
 - Embeddings, audio, fine-tuning, the Assistants API, and the other Images
   endpoints (`/v1/images/edits`, `/v1/images/variations`). *Exception:*
-  speech output (`/v1/audio/speech`) was added in step 14 (§3.3).
-  Transcription, translation and audio input stay non-goals.
+  speech output (`/v1/audio/speech`) was added in step 14 (§3.3), and
+  transcription (`/v1/audio/transcriptions`) is planned as step 15 (§3.4).
+  Translation and audio input to chat turns stay non-goals.
 - Exposing it on a network or supporting more than one user.
 - Automatic Claude↔Codex failover. That idea lives in Conduit's
   `CODEX_INTEGRATION_HOWTO.md`. Conduix is the standalone half it would build on.
@@ -59,6 +60,7 @@ Rust via `reqwest` + SSE.
 | POST   | `/v1/chat/completions`  | OpenAI Chat Completions (compat layer over the same core). Optional `session_id`. |
 | POST   | `/v1/images/generations` | OpenAI Images API (a Responses turn with the image tool on, §3.2) |
 | POST   | `/v1/audio/speech`      | OpenAI text-to-speech over Codex thread realtime (§3.3). Experimental, off unless `CONDUIX_SPEECH=1` |
+| POST   | `/v1/audio/transcriptions` | *Planned, step 15.* OpenAI speech-to-text over the same realtime session (§3.4). Experimental, off by default |
 | GET    | `/v1/models`            | Models the logged-in plan can use (from the Codex model list). |
 | GET    | `/v1/sessions`          | List active sessions                                 |
 | POST   | `/v1/sessions`          | Create empty session → `{session_id}`                |
@@ -354,6 +356,46 @@ and WAVs in `scratch/probe_voice_*` and `scratch/probe_webrtc_*`.
   and a 330-character input as Opus in two chunks (20.7 s of audio, 35 s).
   All transcripts matched on the first try.
 
+### 3.4 Transcription findings (step 15 spike, 2026-11-16, Codex 0.157.1 bundled)
+
+Source: `scripts/probe_realtime_transcribe.py` (logs in
+`scratch/probe_transcribe_*.jsonl`). The clips were step 14's own output:
+a 4.5 s MP3 (`juniper`) and the 20.8 s two-chunk Opus (`cove`).
+
+- **The realtime session transcribes what it hears.** Audio played into the
+  WebRTC microphone track comes back as `thread/realtime/transcript/done` with
+  `role: "user"`, one per user turn. The data channel also streams it as it
+  goes: `input_transcript.added` per word or two, with `start_ms` / `end_ms`
+  on the session's timeline in 200 ms steps, and `turn.created` / `turn.done`
+  with `role: "user"`.
+- **Accuracy:** the 4.5 s clip was exact every time ("Hi, this is Juniper
+  speaking through Conduix on your ChatGPT plan"; only the final period
+  dropped). Over four runs of the 20.8 s clip, everything was exact except
+  the coined name "Conduix" ("Can Dewix", "Candux", "Can do it"),
+  "plan." → "planned" twice, and "WebRTC" → "Web RTC" once. The whole clip
+  was one user turn each time (its 0.25 s gap didn't split it).
+- **Real time.** The audio has to be played at its own speed: ~7 s setup,
+  then the audio's length, then ~2–3 s to the final transcript (4.5 s →
+  ~14 s, 20.8 s → ~31 s).
+- **Audio sent before the data channel's `session.started` is lost** (one run
+  lost its first sentence). Send silence until then.
+- **Output must be audio.** `outputModality: "text"` → "text realtime output
+  modality requires realtime v2", and v2 is refused (§3.3). The voice replies
+  out loud once the speaker stops ("Hey Juniper, I'm here and ready…"); the
+  replies are simply not recorded.
+- **The voice can delegate to Codex, which runs a real turn.** On the longer
+  clip the v3 model raised `delegation.created` (data channel) /
+  `thread/realtime/itemAdded` `handoff_request`, and Codex started a turn
+  on the thread *before* the user transcript arrived: a `userMessage`
+  wrapping `<realtime_delegation>`, one model call (~4.75k input tokens), an
+  empty answer. It is the voice model's choice: the short clip never
+  delegated. A "never delegate" prompt didn't stop it, and neither did
+  `clientManagedHandoffs: true`.
+- **Interrupting it works.** `turn/interrupt` sent as soon as `turn/started`
+  appears on the thread ended the turn in 108 ms with status `interrupted`,
+  before any model call (no `thread/tokenUsage/updated`, no items).
+- Not seen: a language field, confidence scores, or punctuation control.
+
 ---
 
 ## 4. Feature map (v1 target)
@@ -370,6 +412,7 @@ and WAVs in `scratch/probe_voice_*` and `scratch/probe_webrtc_*`.
 | Custom function tools (client-executed)   | ✅ v1.1 | Codex dynamic tools; on a call the response ends with `function_call` and the turn is interrupted; `function_call_output` resumes on a rebuilt thread (§7, verified live 2026-09-27) |
 | Hosted `web_search`                       | ✅ v1.1 | `tools: [{"type": "web_search"}]` / chat `web_search_options` turn Codex's web search on for that thread (`CONDUIX_WEB_SEARCH_MODE`, default `live`); `web_search_call` output items |
 | Image generation (`image_generation` tool, `/v1/images/generations`) | ✅ v1.2 | `tools: [{"type": "image_generation"}]` turns Codex's image tool on for that thread; `image_generation_call` output items with the PNG in `result`. Earlier images are replayed as a user image message (§3.2). `/v1/images/generations` runs the same turn and stops it once the image is in. Not on Chat Completions (no image output shape) or with `session_id`. Tool options are ignored; the images endpoint passes `size` / `background` as a hint |
+| Transcription (`/v1/audio/transcriptions`) | ⏳ v1.4 | Planned, step 15 (§3.4). The upload is played into a Codex realtime v3 session over WebRTC; the session's user transcript is the result |
 | Speech output (`/v1/audio/speech`)        | ✅ v1.3 | Experimental, `CONDUIX_SPEECH=1` and `conduix[voice]`. A Codex realtime v3 session over WebRTC reads the input chunk by chunk; each transcript is checked against its chunk (§3.3). All six `response_format`s; no streaming. OpenAI voice names map to the default voice, `speed` and `instructions` are hints |
 | `temperature`, `top_p`, `stop`, `max_output_tokens` | ⚠️ | Accepted. Applied where Codex supports them, otherwise ignored, and the docs list which |
 | Structured outputs (`text.format` json_schema) | ✅ | Passed as the turn's `output_schema`; verified live 2026-09-27. Upstream only accepts strict schemas, and a schema allowing only `{}` never finishes (found live), so it gets a 400 |
@@ -402,7 +445,7 @@ conduix/
   routes/models.py
   routes/sessions.py
 tests/              unit (offline, fake backend) + integration (-m integration)
-scripts/            probe_sdk.py (step 2), probe_image_gen.py (step 13), probe_realtime_voice.py + probe_realtime_webrtc.py (step 14 spike) + demos: inference, multiturn, image, effort
+scripts/            probe_sdk.py (step 2), probe_image_gen.py (step 13), probe_realtime_voice.py + probe_realtime_webrtc.py (step 14 spike), probe_realtime_transcribe.py (step 15 spike) + demos: inference, multiturn, image, effort
 scratch/            local probe logs (gitignored)
 plan/               step-by-step build plan, same style as Conduit's plan/
 start_app.ps1       kill (whole process tree) and restart on port
@@ -510,6 +553,45 @@ passes.
     - **Tests:** offline, extend `tests/fake_app_server.py` with the realtime
       methods and fake the peer; live, one short phrase per output format
       through `client.audio.speech.create`, and the transcript check.
+15. **v1.4: transcription** (spike done 2026-11-16, findings in §3.4; not built).
+    `POST /v1/audio/transcriptions` in OpenAI's shape: multipart `file`
+    (required, ≤ 25 MB), `model`, `language`, `prompt`, `response_format`,
+    `temperature`, `timestamp_granularities[]`. Off unless
+    `CONDUIX_TRANSCRIPTION=1`; needs the same `conduix[voice]` extra.
+    - **Input:** decode any format PyAV reads (mp3, mp4/m4a, wav, webm,
+      ogg/opus, flac) to 48 kHz mono PCM16. Reject a file it can't decode
+      (400 `invalid_audio`) or longer than `CONDUIX_TRANSCRIPTION_MAX_SECONDS`
+      (default 600: every second costs a second of wall time).
+    - **Peer:** extend `voice.py`'s `AiortcPeer` with an input track that
+      sends silence until told to play, then the PCM paced in real time,
+      then silence. Speech keeps its silent microphone.
+    - **Session:** `open_realtime` with a listen-only prompt (`language` and
+      `prompt` added as hints); after `session.started`, play the audio; collect
+      every `role: "user"` transcript; finish once playback has ended plus
+      ~2 s of silence and no user turn is still open (data channel
+      `turn.created` without its `turn.done`), with a timeout. Voice replies
+      are ignored. Then stop and unsubscribe, as speech does.
+    - **Delegation guard (backend):** while a realtime session is open on a
+      thread, the reader loop watches that thread for `turn/started` and
+      sends `turn/interrupt` at once, counting it in `blocked_items`
+      (`delegatedTurn`). Applies to speech sessions too.
+    - **Output:** `json` `{"text"}` (user turns joined with a space,
+      trimmed); `text`; `verbose_json` with `duration`, `segments` (one
+      per user turn) and, with `timestamp_granularities[]=word`, `words`
+      from `input_transcript.added` (times shifted by when playback started;
+      200 ms resolution); `srt` and `vtt` from the segments. `language` in
+      `verbose_json` is the request's value or `"unknown"`. No streaming in
+      the first cut (`stream: true` is a 400); `input_transcript.added`
+      could feed `transcript.text.delta` events later. `usage` as
+      `{"type": "duration", "seconds"}`.
+    - **Concurrency:** shares speech's lock: one voice session at a time.
+    - **Errors:** as speech, with `transcription_disabled`; a session that
+      hears nothing returns `{"text": ""}`, not an error.
+    - **Tests:** offline, the fake app-server gets a test-only method the fake
+      peer calls when it "plays" audio, which makes the server emit a user
+      transcript (and, by keyword, a delegated `turn/started` to check the
+      interrupt); live, the step-14 samples through
+      `client.audio.transcriptions.create` in `json` and `verbose_json`.
 
 ### Acceptance for v1
 
@@ -612,6 +694,19 @@ tools through a prompt has no effect on disk.
   - Each request costs about 6 s of setup before audio. Reusing one warm
     session across requests could cut that but mixes context between
     requests; decide after the first cut.
+- **Transcription** (step 15, §3.4):
+  - It is a byproduct of a conversational voice model: no confidence
+    scores and no language detection. It mishears names and coined words, and
+    may differ from run to run. `language` and `prompt` are untested hints.
+  - Real-time cost: an hour of audio would hold the only voice slot for an
+    hour. Hence the duration cap, and why chunking or parallel sessions
+    would need their own spike.
+  - Delegated turns are interrupted, not prevented. If a Codex update moves
+    the model call earlier, they would cost quota again; `blocked_items`
+    on `/health` shows how often it happens.
+  - Long pauses may split the audio into several user turns, and the voice's
+    own replies might overlap later speech; only tested with continuous
+    clips so far.
 - **Quota signal.** *Mostly settled.* Classification uses Codex's own
   `codexErrorInfo` enum from the app-server protocol schema
   (`usageLimitExceeded`, `rateLimitExceeded`, ...), never message text, and the
