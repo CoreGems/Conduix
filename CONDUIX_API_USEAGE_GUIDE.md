@@ -2,10 +2,11 @@
 
 How to connect a client to Conduix and use it.
 
-> **Status: v1.3, built and tested.** Everything below works against a live
+> **Status: v1.4, built and tested.** Everything below works against a live
 > ChatGPT plan (`openai-codex` 0.157.1): Responses and Chat Completions,
 > streaming, three multi-turn styles, images, image generation, structured
-> output and JSON mode, function tools, web search, and (experimental) speech. Model names and limits
+> output and JSON mode, function tools, web search, and (experimental) speech
+> and transcription. Model names and limits
 > depend on the plan that Codex is logged in to.
 
 ---
@@ -79,6 +80,7 @@ A Swagger console for trying requests by hand is at
 | POST   | `/v1/chat/completions`  | OpenAI Chat Completions, for older clients and tools |
 | POST   | `/v1/images/generations` | OpenAI Images API: generate an image (§8) |
 | POST   | `/v1/audio/speech`      | OpenAI text-to-speech, experimental and off by default (§16) |
+| POST   | `/v1/audio/transcriptions` | OpenAI speech-to-text, experimental and off by default (§17) |
 | GET    | `/v1/models`            | Models your plan can use |
 | GET    | `/v1/models/{id}`       | One model, with its supported `effort` values |
 | POST   | `/v1/sessions`          | Create a server-side conversation → `{session_id}` |
@@ -735,7 +737,8 @@ Errors use OpenAI's error envelope:
 | Images API `n` > 1, `response_format: "url"`, `stream: true` | 400 |
 | Image generation on Chat Completions or with `session_id` | 400 |
 | Speech `stream_format: "sse"`, unknown voice names | 400; OpenAI voice names map to the default voice (§16) |
-| Embeddings, transcription and other audio input, image edits and variations (`/v1/images/edits`, ...), files, Assistants, batch | Not available |
+| Transcription `stream: true`, `temperature`, `include[]`, `chunking_strategy` | `stream` is a 400; the rest are ignored (§17) |
+| Embeddings, translation, audio input to chat turns, image edits and variations (`/v1/images/edits`, ...), files, Assistants, batch | Not available |
 | Parallel requests on one session | Queued, one at a time |
 
 The model has **no access** to your files or shell, and no network access
@@ -829,3 +832,68 @@ else.
 - **Experimental.** It relies on an experimental Codex protocol, so a Codex
   update can break it. When that happens it fails with one of the errors
   above, never with silent audio.
+
+---
+
+## 17. Transcription (experimental)
+
+`/v1/audio/transcriptions` turns speech into text on your ChatGPT plan. Like
+speech output it is **off by default**: install the voice extra and start
+Conduix with `CONDUIX_TRANSCRIPTION=1` (both can be on at once).
+
+```powershell
+conda run -n conduix pip install -e ".[voice]"
+$env:CONDUIX_TRANSCRIPTION = "1"; .\start_app.ps1
+```
+
+```python
+with open("meeting.mp3", "rb") as f:
+    t = client.audio.transcriptions.create(model="whisper-1", file=f)   # model is ignored
+print(t.text)
+
+# Segments and word timings
+with open("meeting.mp3", "rb") as f:
+    v = client.audio.transcriptions.create(
+        model="whisper-1", file=f, response_format="verbose_json",
+        timestamp_granularities=["word", "segment"],
+        language="en", prompt="Conduix, WebRTC",   # hints for the listener
+    )
+for w in v.words:
+    print(w.word, w.start, w.end)
+```
+
+**How it works.** The upload is decoded, then played into a realtime voice
+session's microphone **in real time**, and what the voice heard becomes the
+transcript. It is the same session speech output uses, listening instead of
+talking.
+
+**Formats:** `json` (default, `{"text", "usage": {"type": "duration",
+"seconds"}}`), `text`, `verbose_json`, `srt`, `vtt`. `verbose_json` has
+`duration`, one segment per stretch of speech, and with
+`timestamp_granularities=["word"]` a `words` list. `language` is your
+`language` value or `"unknown"`; the score fields (`avg_logprob`, ...) are 0.
+
+**Input:** any format FFmpeg reads (mp3, mp4/m4a, wav, webm, ogg/opus,
+flac, ...), up to 25 MB and `CONDUIX_TRANSCRIPTION_MAX_SECONDS` (600 s).
+
+**Notes and limits:**
+
+- **Real time.** A recording takes its own length to transcribe, plus about
+  10 seconds: 4.5 s of audio took ~13 s, 20.8 s took ~30 s. One voice
+  request (speech or transcription) runs at a time.
+- **Accuracy.** Clear speech came back word for word. Names and made-up
+  words get misheard ("Conduix" came back as "Can Duix"), and the same clip
+  can come back slightly differently on another run. `prompt` and `language`
+  are passed to the listener as hints; how much they help is untested.
+- **Timings are approximate:** 200 ms resolution, aligned to where speech
+  starts in your file. Loud non-speech before the first word (music, noise)
+  can throw them off.
+- **Silence** returns `{"text": ""}`, not an error.
+- **No streaming** (`stream: true` returns **400**), no translation endpoint,
+  no language detection, no confidence scores.
+- **Errors.** Turned off returns **501** `transcription_disabled`, and a
+  missing voice extra returns **501** `transcription_unavailable`. A file
+  that won't decode returns **400** `invalid_audio`. Session failures are
+  the same as speech's (**502** `speech_failed`, **504** `speech_timeout`,
+  **429** when the plan's usage window is full).
+- **Experimental**, like speech: it relies on an experimental Codex protocol.

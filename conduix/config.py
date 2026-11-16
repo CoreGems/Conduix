@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     # difflib ratio) before the audio is accepted.
     speech_min_similarity: float = 0.8
 
+    # Transcription, /v1/audio/transcriptions (experimental; same extra).
+    transcription: bool = False
+    # Longest upload accepted: it is played in real time, holding the only
+    # voice session for as long as it lasts.
+    transcription_max_seconds: int = 600
+
 
 @lru_cache
 def settings() -> Settings:

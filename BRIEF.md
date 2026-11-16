@@ -44,7 +44,7 @@ Rust via `reqwest` + SSE.
 - Embeddings, audio, fine-tuning, the Assistants API, and the other Images
   endpoints (`/v1/images/edits`, `/v1/images/variations`). *Exception:*
   speech output (`/v1/audio/speech`) was added in step 14 (§3.3), and
-  transcription (`/v1/audio/transcriptions`) is planned as step 15 (§3.4).
+  transcription (`/v1/audio/transcriptions`) in step 15 (§3.4).
   Translation and audio input to chat turns stay non-goals.
 - Exposing it on a network or supporting more than one user.
 - Automatic Claude↔Codex failover. That idea lives in Conduit's
@@ -60,7 +60,7 @@ Rust via `reqwest` + SSE.
 | POST   | `/v1/chat/completions`  | OpenAI Chat Completions (compat layer over the same core). Optional `session_id`. |
 | POST   | `/v1/images/generations` | OpenAI Images API (a Responses turn with the image tool on, §3.2) |
 | POST   | `/v1/audio/speech`      | OpenAI text-to-speech over Codex thread realtime (§3.3). Experimental, off unless `CONDUIX_SPEECH=1` |
-| POST   | `/v1/audio/transcriptions` | *Planned, step 15.* OpenAI speech-to-text over the same realtime session (§3.4). Experimental, off by default |
+| POST   | `/v1/audio/transcriptions` | OpenAI speech-to-text over the same realtime session (§3.4). Experimental, off unless `CONDUIX_TRANSCRIPTION=1` |
 | GET    | `/v1/models`            | Models the logged-in plan can use (from the Codex model list). |
 | GET    | `/v1/sessions`          | List active sessions                                 |
 | POST   | `/v1/sessions`          | Create empty session → `{session_id}`                |
@@ -412,7 +412,7 @@ a 4.5 s MP3 (`juniper`) and the 20.8 s two-chunk Opus (`cove`).
 | Custom function tools (client-executed)   | ✅ v1.1 | Codex dynamic tools; on a call the response ends with `function_call` and the turn is interrupted; `function_call_output` resumes on a rebuilt thread (§7, verified live 2026-09-27) |
 | Hosted `web_search`                       | ✅ v1.1 | `tools: [{"type": "web_search"}]` / chat `web_search_options` turn Codex's web search on for that thread (`CONDUIX_WEB_SEARCH_MODE`, default `live`); `web_search_call` output items |
 | Image generation (`image_generation` tool, `/v1/images/generations`) | ✅ v1.2 | `tools: [{"type": "image_generation"}]` turns Codex's image tool on for that thread; `image_generation_call` output items with the PNG in `result`. Earlier images are replayed as a user image message (§3.2). `/v1/images/generations` runs the same turn and stops it once the image is in. Not on Chat Completions (no image output shape) or with `session_id`. Tool options are ignored; the images endpoint passes `size` / `background` as a hint |
-| Transcription (`/v1/audio/transcriptions`) | ⏳ v1.4 | Planned, step 15 (§3.4). The upload is played into a Codex realtime v3 session over WebRTC; the session's user transcript is the result |
+| Transcription (`/v1/audio/transcriptions`) | ✅ v1.4 | Experimental, `CONDUIX_TRANSCRIPTION=1` and `conduix[voice]`. The upload is played into a Codex realtime v3 session over WebRTC; the session's user transcript is the result (§3.4). `json`, `text`, `verbose_json` (segments, word timings), `srt`, `vtt`; no streaming. Delegated Codex turns are interrupted |
 | Speech output (`/v1/audio/speech`)        | ✅ v1.3 | Experimental, `CONDUIX_SPEECH=1` and `conduix[voice]`. A Codex realtime v3 session over WebRTC reads the input chunk by chunk; each transcript is checked against its chunk (§3.3). All six `response_format`s; no streaming. OpenAI voice names map to the default voice, `speed` and `instructions` are hints |
 | `temperature`, `top_p`, `stop`, `max_output_tokens` | ⚠️ | Accepted. Applied where Codex supports them, otherwise ignored, and the docs list which |
 | Structured outputs (`text.format` json_schema) | ✅ | Passed as the turn's `output_schema`; verified live 2026-09-27. Upstream only accepts strict schemas, and a schema allowing only `{}` never finishes (found live), so it gets a 400 |
@@ -440,8 +440,9 @@ conduix/
   routes/responses.py
   routes/chat.py
   routes/images.py
-  routes/audio.py   POST /v1/audio/speech
-  voice.py          speech: the aiortc WebRTC peer, chunking, transcript check, encoding
+  routes/audio.py   POST /v1/audio/speech, /v1/audio/transcriptions
+  voice.py          the aiortc WebRTC peer; speech (chunking, transcript check, encoding)
+                    and transcription (decoding, listening, timings, output formats)
   routes/models.py
   routes/sessions.py
 tests/              unit (offline, fake backend) + integration (-m integration)
@@ -469,6 +470,8 @@ start_app.ps1       kill (whole process tree) and restart on port
 | `CONDUIX_SPEECH`                 | `false`; `1` turns on `/v1/audio/speech` (experimental) |
 | `CONDUIX_SPEECH_VOICE`           | `cove`, the realtime v3 voice for OpenAI voice names |
 | `CONDUIX_SPEECH_MIN_SIMILARITY`  | `0.8`, how closely a transcript must match its chunk |
+| `CONDUIX_TRANSCRIPTION`          | `false`; `1` turns on `/v1/audio/transcriptions` (experimental) |
+| `CONDUIX_TRANSCRIPTION_MAX_SECONDS` | `600`, the longest upload (it is played in real time) |
 
 **Billing guard:** at startup, call `codex.account()` and refuse to serve
 unless `account.type == "chatgpt"`. Log `plan_type` and show it on
@@ -553,7 +556,27 @@ passes.
     - **Tests:** offline, extend `tests/fake_app_server.py` with the realtime
       methods and fake the peer; live, one short phrase per output format
       through `client.audio.speech.create`, and the transcript check.
-15. **v1.4: transcription** (spike done 2026-11-16, findings in §3.4; not built).
+15. ✅ **v1.4: transcription** (done 2026-11-16, findings in §3.4).
+    Built as planned below, except:
+    - **Timings are calibrated on the audio.** The data channel stamps words
+      when the recognizer emits them, ~0.7 s after they are spoken (found
+      live). Every timing is shifted so the first word starts where speech
+      starts in the upload (energy threshold, 10 ms windows), capped at 2 s;
+      the last segment ends where speech ends, not after the trailing
+      silence.
+    - **Finishing** waits for playback to end, `listen_quiet` (2 s) with no
+      open user turn, and Codex's transcript for every data-channel turn;
+      it gives up `listen_extra` (30 s) after the audio's length.
+    - `python-multipart` joined the `voice` extra; the route parses the form
+      itself, so the server starts without it (501
+      `transcription_unavailable`). A non-multipart body is a 400 on `file`.
+    - Failures reuse speech's codes (`speech_failed`, `speech_timeout`).
+    - Tests: `tests/test_transcription.py` (25, offline).
+    Verified live through `client.audio.transcriptions.create`: the step-14
+    samples as `json`, `verbose_json` with words, and `srt`/`text`; a
+    delegated turn on the 20.8 s clip was interrupted (`delegatedTurn` on
+    `/health`). One early request timed out (504) and didn't reproduce in
+    five more; the give-up path now logs its state.
     `POST /v1/audio/transcriptions` in OpenAI's shape: multipart `file`
     (required, ≤ 25 MB), `model`, `language`, `prompt`, `response_format`,
     `temperature`, `timestamp_granularities[]`. Off unless
@@ -694,7 +717,7 @@ tools through a prompt has no effect on disk.
   - Each request costs about 6 s of setup before audio. Reusing one warm
     session across requests could cut that but mixes context between
     requests; decide after the first cut.
-- **Transcription** (step 15, §3.4):
+- **Transcription** (step 15, §3.4). Still open:
   - It is a byproduct of a conversational voice model: no confidence
     scores and no language detection. It mishears names and coined words, and
     may differ from run to run. `language` and `prompt` are untested hints.
@@ -707,6 +730,9 @@ tools through a prompt has no effect on disk.
   - Long pauses may split the audio into several user turns, and the voice's
     own replies might overlap later speech; only tested with continuous
     clips so far.
+  - The one live 504 (first request after a server start) is unexplained.
+  - Word timings are only as good as the onset calibration: audio with
+    loud non-speech before the first word (music, noise) will shift them.
 - **Quota signal.** *Mostly settled.* Classification uses Codex's own
   `codexErrorInfo` enum from the app-server protocol schema
   (`usageLimitExceeded`, `rateLimitExceeded`, ...), never message text, and the

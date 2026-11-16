@@ -37,6 +37,11 @@ prefix. Keywords in that text:
     ONCE     says "Mhm." the first time, then the text
     RTERROR  a thread/realtime/error instead of a transcript
 
+`fake/realtime/hear` {"text"} (test-only, called by the fake WebRTC peer when
+it "plays" audio) makes the latest realtime session hear `text`: a user
+transcript, or with DELEGATE in it first a delegated Codex turn
+(turn/started, then waits for turn/interrupt), or with RTERROR an error.
+
 `fake/stats` returns what the server saw, for assertions. Environment:
 FAKE_ACCOUNT=none makes account/read report no login.
 """
@@ -197,6 +202,7 @@ V3_VOICES = ["juniper", "maple", "spruce", "ember", "vale", "breeze", "arbor", "
              "aube", "bubbie", "haetsal", "hanul", "himari", "leher", "miko", "neer", "porto",
              "rindo", "rio", "rivage", "selva", "sonna", "tinta", "viola"]
 realtime_seen: dict[str, int] = {}  # thread id → appendText calls
+last_realtime: list[str] = []  # thread ids, in the order realtime started
 
 
 def realtime_start(params: dict) -> None:
@@ -229,6 +235,25 @@ def realtime_speak(tid: str, text: str) -> None:
         said = "Mhm."
     notify("thread/realtime/transcript/done", {"threadId": tid, "role": "assistant",
                                                "text": " " + said})
+
+
+def realtime_hear(tid: str, text: str) -> None:
+    if "RTERROR" in text:
+        notify("thread/realtime/error", {"threadId": tid, "message": "voice backend failed"})
+        return
+    if "DELEGATE" in text:
+        turn_id = str(uuid.uuid4())
+        notify("turn/started", {"threadId": tid, "turn": {
+            "id": turn_id, "items": [], "status": "inProgress"}})
+        for _ in range(300):
+            if turn_id in interrupts:
+                notify("turn/completed", {"threadId": tid, "turn": {
+                    "id": turn_id, "items": [], "status": "interrupted"}})
+                break
+            time.sleep(0.01)
+    if text:
+        notify("thread/realtime/transcript/done", {"threadId": tid, "role": "user",
+                                                   "text": " " + text})
 
 
 def handle(method: str, params: dict) -> dict | None:
@@ -280,8 +305,12 @@ def handle(method: str, params: dict) -> dict | None:
     if method == "thread/realtime/listVoices":
         return {"voices": {"v1": V3_VOICES[:9], "v2": ["alloy", "marin"], "v3": V3_VOICES,
                            "defaultV1": "cove", "defaultV2": "marin"}}
+    if method == "fake/realtime/hear":
+        threading.Timer(0.01, realtime_hear, (last_realtime[-1], params.get("text", ""))).start()
+        return {}
     if method == "thread/realtime/start":
         stats["realtime_start"].append(params)
+        last_realtime.append(params["threadId"])
         threading.Timer(0.01, realtime_start, (params,)).start()
         return {}
     if method == "thread/realtime/appendText":

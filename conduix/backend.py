@@ -557,9 +557,10 @@ class Backend:
           * not answer `item/tool/call` at all. It is re-routed into the
             turn's notification stream (TOOL_CALL_METHOD) so run_turn yields a
             ToolCall in order with the rest of the turn.
-          * hand `thread/realtime/*` notifications of a speech session to
+          * hand `thread/realtime/*` notifications of a voice session to
             that session (open_realtime) instead of the SDK's global queue,
-            which nothing reads.
+            which nothing reads, and show it `turn/started` on its thread
+            (a turn the voice delegated, which it interrupts).
         Everything else is routed exactly as the SDK's own loop does
         (openai_codex/client.py, CodexClient._reader_loop, 0.157.1).
         """
@@ -576,12 +577,14 @@ class Backend:
                             sync._write_message(reply)
                         continue
                     if method is not None:
-                        if isinstance(method, str) and method.startswith("thread/realtime/"):
+                        if isinstance(method, str) and (method.startswith("thread/realtime/")
+                                                        or method == "turn/started"):
                             params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
                             listener = self._realtime.get(params.get("threadId", ""))
                             if listener is not None:
                                 listener(method, params)
-                                continue
+                                if method != "turn/started":
+                                    continue
                         if isinstance(method, str):
                             sync._router.route_notification(
                                 sync._coerce_notification(method, msg.get("params")))
@@ -836,6 +839,13 @@ class Backend:
         loop = asyncio.get_running_loop()
 
         def deliver(method: str, params: dict[str, Any]) -> None:  # on the reader thread
+            if method == "turn/started":
+                # The voice delegated to Codex (BRIEF.md §3.4). Never wanted:
+                # stop it before its model call.
+                turn_id = (params.get("turn") or {}).get("id")
+                if turn_id:
+                    loop.call_soon_threadsafe(self._stop_delegated_turn, thread.id, turn_id)
+                return
             ev = map_realtime(method, params)
             if ev is not None:
                 loop.call_soon_threadsafe(session.events.put_nowait, ev)
@@ -856,6 +866,28 @@ class Backend:
             await session.close()
             raise
         return session
+
+    def _stop_delegated_turn(self, thread_id: str, turn_id: str) -> None:
+        """Interrupt a Codex turn the realtime voice started by delegating.
+
+        Found live: interrupting at `turn/started` ends it in ~100 ms, before
+        its model call, so it costs no quota. Counted as a blocked item.
+        """
+        self.blocked_items["delegatedTurn"] = self.blocked_items.get("delegatedTurn", 0) + 1
+        log.warning("realtime voice delegated a Codex turn on thread %s; interrupting it",
+                    thread_id)
+
+        async def interrupt() -> None:
+            try:
+                await asyncio.wait_for(self.codex._client.request(
+                    "turn/interrupt", {"threadId": thread_id, "turnId": turn_id},
+                    response_model=_AnyResult), timeout=5)
+            except Exception as e:  # noqa: BLE001 - best effort
+                log.warning("could not interrupt delegated turn %s: %s", turn_id, e)
+
+        task = asyncio.get_running_loop().create_task(interrupt())
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
 
     async def run_turn(
         self,

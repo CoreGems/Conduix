@@ -27,6 +27,7 @@ Conduit, read §13 first: it lists what is different.
 | Structured output | `text.format` `json_schema` (strict schemas) and `json_object` (instructed, best effort). `client.responses.parse(text_format=Model)` works. See §2.1, §8.6 and `RAG_INTEGRATION.md`. |
 | Documents and citations | No `input_file` parts. Send passages as `x_document` parts for verified citations (`x_document_citation` annotations with character offsets), or as `input_text` with a citation convention. See `RAG_INTEGRATION.md`. |
 | Speech | `POST /v1/audio/speech`, **experimental and off by default** (`CONDUIX_SPEECH=1` on the server). A realtime voice reads the input; each chunk's transcript is checked. ~13 s for a short phrase, one request at a time. See §2.6. |
+| Transcription | `POST /v1/audio/transcriptions`, **experimental and off by default** (`CONDUIX_TRANSCRIPTION=1`). The upload is played into a realtime voice session in real time (audio length + ~10 s). `json`, `text`, `verbose_json` with word timings, `srt`, `vtt`. See §2.7. |
 | Validation errors | **400** with OpenAI's error envelope and a `param` naming the field. Not 422. |
 | Latency | About 3–4 s to the first token at low effort; minutes are possible at high effort. Expect ~4.4k input tokens of fixed Codex overhead per call, mostly cached. |
 
@@ -84,6 +85,7 @@ continuation as "resend the history" (§4.2).
 | POST | `/v1/chat/completions` | OpenAI Chat Completions, translated onto the Responses path |
 | POST | `/v1/images/generations` | OpenAI Images API (generate only) |
 | POST | `/v1/audio/speech` | OpenAI text-to-speech. Experimental, off unless the server sets `CONDUIX_SPEECH=1` (§2.6) |
+| POST | `/v1/audio/transcriptions` | OpenAI speech-to-text. Experimental, off unless the server sets `CONDUIX_TRANSCRIPTION=1` (§2.7) |
 | GET | `/v1/models` | Models the plan can use, with their `efforts` |
 | GET | `/v1/models/{id}` | One model |
 | POST | `/v1/sessions` | Create a server-side conversation (Conduix extension) |
@@ -302,6 +304,43 @@ It relies on an experimental Codex protocol; a Codex update can break it, and
 then it fails with one of the errors above. Feature-detect with one short call
 rather than assuming it is there.
 
+### 2.7 `POST /v1/audio/transcriptions` (experimental)
+
+OpenAI's speech-to-text shape: `multipart/form-data` with the audio in
+`file`. The upload is decoded (anything FFmpeg reads), played into a realtime
+voice session's microphone **in real time**, and the voice's transcript of
+what it heard is returned. Off unless the server runs with
+`CONDUIX_TRANSCRIPTION=1` and has the `voice` extra; otherwise `501`.
+
+| Field | Notes |
+|---|---|
+| `file` | Required. ≤ 25 MB and ≤ `CONDUIX_TRANSCRIPTION_MAX_SECONDS` (600) of audio, else `400`, `param: "file"`. Undecodable → `400 invalid_audio`. A JSON body → `400`. |
+| `response_format` | `json` (default) → `{"text", "usage": {"type": "duration", "seconds"}}`; `text`; `verbose_json` → `{"task", "language", "duration", "text", "segments", "words"?, "usage"}`; `srt`; `vtt`. |
+| `timestamp_granularities[]` | `word` and/or `segment`, only with `verbose_json` (else `400`). `word` adds `words: [{"word", "start", "end"}]`. |
+| `language`, `prompt` | Passed to the listener as hints. `language` is echoed in `verbose_json` (else `"unknown"`); there is no detection. |
+| `stream` | `true` → `400`. |
+| `model`, `temperature`, `include[]`, `chunking_strategy` | Accepted and ignored. |
+
+**Segments** are stretches of speech (the voice's user turns; a continuous
+20 s clip is one). Times are seconds from the start of the file, 200 ms
+resolution, aligned to where speech starts in the audio. Segment score fields
+(`avg_logprob`, `no_speech_prob`, ...) are always 0 and `tokens` is `[]`.
+
+**Timing:** the audio's length plus ~10 s (4.5 s → ~13 s, 20.8 s → ~30 s).
+Shares speech's single voice slot: one audio request at a time.
+
+**Accuracy:** clear speech came back verbatim in testing; names and coined
+words are misheard and runs can differ slightly. Silence returns
+`{"text": ""}`.
+
+**Errors** (all with `x-should-retry: false`): `501 transcription_disabled`,
+`501 transcription_unavailable`, and the session failures of §2.6 (`502
+speech_failed`, `504 speech_timeout`, `429 usage_limit_exceeded`).
+
+The voice can hand what it heard to Codex ("delegation"), which would start a
+real model turn. Conduix interrupts any such turn at once, before its model
+call; `/health` counts them under `blocked_agent_items.delegatedTurn`.
+
 ---
 
 ## 3. Wire format details
@@ -329,7 +368,7 @@ Content parts:
 | `input_image` | `image_url`: `data:image/png;base64,...` | PNG, JPEG, GIF, WebP; ≤ 20 MB. **User messages only.** `https://` URLs → `400 invalid_image_url`; `file_id` → 400. A model without image input → `400 unsupported_value`. |
 | `image_url` | `{"url": "data:..."}` | The Chat Completions spelling; accepted on both endpoints. |
 | `x_document` | `text`, optional `id`, `title`, `context`, `citations` | Conduix extension: a document the answer can cite with verified offsets. Newest user message only. `RAG_INTEGRATION.md` §2.0. |
-| `input_file`, `input_audio`, ... | | `400 content part type '...' is not supported`. Audio input isn't supported (speech is output only, §2.6). Documents: `x_document` or text. |
+| `input_file`, `input_audio`, ... | | `400 content part type '...' is not supported`. Audio can't be a chat input; transcribe it first (§2.7). Documents: `x_document` or text. |
 
 The **last** item must be a user message (the new turn) or a
 `function_call_output` (the model continues from your tool results). Several
@@ -711,11 +750,12 @@ awareness, not workarounds.
 7. **No `input_file`.** Documents go in as `x_document` parts (verified `x_document_citation` annotations) or as text with a citation convention (`RAG_INTEGRATION.md`). Web search cites with markdown links, not `url_citation` annotations.
 8. **Images: base64 data URLs only**, user messages only, one of the plan's image-capable models.
 9. **Image generation:** one image per request, PNG base64, options are hints at best, not on chat or sessions.
-10. **Other hosted tools** (file search, code interpreter, MCP, computer use), embeddings, transcription and audio input, image edits/variations, files, Assistants and batch: **not available**.
+10. **Other hosted tools** (file search, code interpreter, MCP, computer use), embeddings, translation, audio input to chat turns, image edits/variations, files, Assistants and batch: **not available**.
 11. **State is in memory.** Sessions, stored responses and generated-image ids vanish on restart. Store: 1000 responses / 256 MB. Sessions: 100, 30 min idle.
 12. **One Codex process.** Up to 100 concurrent turns; a session serialises its own turns.
 13. **Model list is read at startup.** A plan change needs a restart.
 14. **Speech is experimental** (§2.6): off by default, one request at a time, ~7 s setup per request, no streaming, realtime voices only (OpenAI voice names map to the default).
+15. **Transcription is experimental** (§2.7): off by default, real time (audio length + ~10 s), shares speech's one voice slot, no streaming, no language detection or confidence, approximate word timings.
 
 ---
 
@@ -748,8 +788,10 @@ OpenAI's envelope, always:
 | 502 | `upstream_error` | Codex couldn't reach the model / rejected the request | Retry once |
 | 501 | `speech_disabled`, `speech_unavailable` | `/v1/audio/speech` is off on this server, or its `voice` extra isn't installed | Operator sets `CONDUIX_SPEECH=1` / installs `conduix[voice]`; otherwise don't offer speech |
 | 502 | `speech_mismatch` | The voice didn't read a chunk verbatim (twice) | Retry later, or rephrase unusual text (numbers, symbols, very long sentences) |
-| 502 | `speech_failed` | The realtime voice session failed (message passed through) | Retry once; persistent failures usually mean a Codex update broke it |
-| 504 | `speech_timeout` | The voice session didn't start or finish in time | Retry once |
+| 400 | `invalid_audio` | Transcription: the upload couldn't be decoded or holds no audio | Send a real audio file |
+| 501 | `transcription_disabled`, `transcription_unavailable` | `/v1/audio/transcriptions` is off on this server, or its dependencies are missing | Operator sets `CONDUIX_TRANSCRIPTION=1` / installs `conduix[voice]`; otherwise don't offer it |
+| 502 | `speech_failed` | The realtime voice session failed (message passed through); speech and transcription | Retry once; persistent failures usually mean a Codex update broke it |
+| 504 | `speech_timeout` | The voice session didn't start or finish in time; speech and transcription | Retry once |
 | 502 | `no_image_generated` | Images API: the model answered without an image (message says what it said); `x-should-retry: false` | Change the prompt |
 | 503 | `server_overloaded` | Upstream overloaded | Retry with backoff |
 | 503 | `codex_unavailable` | The Codex app-server process went away | Restart Conduix |
@@ -1041,6 +1083,23 @@ up to 4096 characters, but each request holds the server's only voice slot for
 its whole duration: split very long narration into several requests only if
 you need partial results sooner.
 
+### 8.10 Transcription
+
+```python
+with open("note.m4a", "rb") as f:
+    v = client.audio.transcriptions.create(model="whisper-1", file=f,
+                                           response_format="verbose_json",
+                                           timestamp_granularities=["word"])
+print(v.text, v.duration, [(w.word, w.start) for w in v.words][:5])
+```
+
+```bash
+curl -sS http://127.0.0.1:8766/v1/audio/transcriptions \
+  -F file=@note.m4a -F model=whisper-1 -F response_format=srt
+```
+
+Budget the request timeout at the audio's length plus a minute.
+
 ---
 
 ## 9. Pitfalls (read before you debug)
@@ -1071,6 +1130,7 @@ you need partial results sooner.
 24. **Generated images: read the `image_generation_call` item**, not `output_text` (often empty afterwards). `image_generation_call` by `id` only works while the first response is stored.
 25. **`instructions` on a session is fixed.** A different value per request is appended as a developer message, not swapped.
 26. **Speech is slow and serial.** `/v1/audio/speech` takes ~13 s even for a short phrase and serves one request at a time, so don't put it on a latency-critical path or fire many in parallel. A `501` means the server has it off, not that the request was wrong.
+27. **Transcription runs in real time.** A 10-minute recording takes over 10 minutes and blocks speech meanwhile. Keep uploads short, or split them client-side if you need results sooner.
 
 ---
 
@@ -1119,7 +1179,7 @@ Server logs go to stdout at INFO: thread rebuilds (`rebuilding history of resp_.
 
 ## 11. Versioning expectations
 
-Conduix is pre-1.0 (`version` `0.1.0` on `/health`; feature set v1.3) and
+Conduix is pre-1.0 (`version` `0.1.0` on `/health`; feature set v1.4) and
 tracks the OpenAI API loosely:
 
 - Request fields it doesn't know are accepted and ignored on purpose, so
@@ -1132,8 +1192,10 @@ tracks the OpenAI API loosely:
   protocol and may stop working after a Codex update without a Conduix
   release.
 - Not planned for v1: parallel function calls, tools on sessions, `input_file`,
-  `url_citation` annotations, sampling parameters, streaming speech,
-  transcription, persistence across restarts.
+  `url_citation` annotations, sampling parameters, streaming speech or
+  transcription, translation, persistence across restarts.
+- Transcription (`/v1/audio/transcriptions`) is experimental for the same
+  reason as speech.
 
 ---
 
@@ -1148,6 +1210,7 @@ tracks the OpenAI API loosely:
 - [ ] Structured output: a strict `json_schema` returns parseable `output_text`; a non-strict schema gives `400 invalid_json_schema`.
 - [ ] Errors: `error.message` / `error.code` are surfaced; `429 usage_limit_exceeded` is not retried; `error` events on streams are handled.
 - [ ] Speech (if used): a `501` hides the feature; `audio.speech.create` returns playable audio; the client timeout allows ~1 min.
+- [ ] Transcription (if used): a `501` hides the feature; the timeout allows the audio's length plus a minute.
 - [ ] The client cannot fall back to `api.openai.com` or a real key.
 
 ---
@@ -1173,6 +1236,7 @@ tracks the OpenAI API loosely:
 | Hosted tools | `web_search`, `web_fetch` | `web_search`, `image_generation` |
 | Images | Input only | Input and generation |
 | Speech | None | `/v1/audio/speech`, experimental, off by default |
+| Transcription | None | `/v1/audio/transcriptions`, experimental, off by default |
 | Quota error | `429 rate_limit_error` + reset in message | `429 usage_limit_exceeded` + `retry-after` + `x-should-retry: false` |
 | Usage | `input_tokens`, cache fields | OpenAI usage, plus ~4.4k fixed overhead |
 
