@@ -450,7 +450,8 @@ passes.
 3. ✅ **`backend.py`** (done 2026-09-27; `config.py` pulled forward from step 4): a single `AsyncCodex` started and closed in the FastAPI
    lifespan, the chat-only thread defaults, and Codex notifications mapped
    to a small internal event type.
-4. **Schema + config**.
+4. ✅ **Schema + config** (done 2026-09-27, folded into other steps): `config.py` came with
+   step 3, `schema.py` (request parsing over the `openai` types) with step 7.
 5. ✅ **Sessions** (done 2026-09-27; `/v1/sessions` routes and a minimal `errors.py` included): thread per session, locks, eviction.
 6. ✅ **Streaming, Responses API** (done 2026-09-27): the SSE synthesizer and its non-streaming
    collector.
