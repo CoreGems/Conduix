@@ -33,6 +33,8 @@ from openai_codex import (  # noqa: F401 - error types re-exported for errors.py
     TransportClosedError,
 )
 
+from pydantic import BaseModel, ConfigDict
+
 from conduix.config import settings
 
 log = logging.getLogger("conduix.backend")
@@ -356,6 +358,94 @@ def map_notification(method: str, payload: dict[str, Any]) -> list[Event]:
     return []
 
 
+# --- thread realtime (speech output, step 14; BRIEF.md §3.3) ---------------------
+
+# The only transport and protocol version a ChatGPT login can use: websocket
+# needs API-key auth, and the AVAS voice backend refuses v1 and v2.
+REALTIME_VERSION = "v3"
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeStarted:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeAnswer:
+    """The WebRTC SDP answer for the offer sent with thread/realtime/start."""
+    sdp: str
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeTranscript:
+    """One finished voice turn: what the voice said (or heard, role user)."""
+    role: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeError:
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class RealtimeClosed:
+    reason: str
+
+
+RealtimeEvent = RealtimeStarted | RealtimeAnswer | RealtimeTranscript | RealtimeError | RealtimeClosed
+
+
+def map_realtime(method: str, params: dict[str, Any]) -> RealtimeEvent | None:
+    """Map one raw (camelCase) thread/realtime/* notification. Pure."""
+    if method == "thread/realtime/started":
+        return RealtimeStarted()
+    if method == "thread/realtime/sdp":
+        return RealtimeAnswer(params.get("sdp", ""))
+    if method == "thread/realtime/transcript/done":
+        return RealtimeTranscript(params.get("role", ""), params.get("text", ""))
+    if method == "thread/realtime/error":
+        return RealtimeError(params.get("message", "") or "realtime session failed")
+    if method == "thread/realtime/closed":
+        return RealtimeClosed(params.get("reason", "") or "closed")
+    return None  # deltas, items: not needed
+
+
+class RealtimeSession:
+    """A realtime voice session on its own chat-only thread (Backend.open_realtime).
+
+    Codex holds the session; the client is the WebRTC peer and gets the audio
+    on its media track. Events arrive on `events`.
+    """
+
+    def __init__(self, backend: Backend, thread_id: str) -> None:
+        self._backend = backend
+        self.thread_id = thread_id
+        self.events: asyncio.Queue[RealtimeEvent] = asyncio.Queue()
+
+    async def _request(self, method: str, params: dict[str, Any]) -> None:
+        await self._backend.codex._client.request(method, {"threadId": self.thread_id, **params},
+                                                  response_model=_AnyResult)
+
+    async def append_text(self, text: str) -> None:
+        """Send text to the voice model as a user message."""
+        await self._request("thread/realtime/appendText", {"text": text})
+
+    async def close(self) -> None:
+        """Stop the session and unload its thread. Best effort, never raises."""
+        try:
+            await asyncio.wait_for(self._request("thread/realtime/stop", {}), timeout=5)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not stop realtime on thread %s: %s", self.thread_id, e)
+        self._backend._realtime.pop(self.thread_id, None)
+        await self._backend.close_thread(self.thread_id)
+
+
+class _AnyResult(BaseModel):
+    """The realtime methods' (empty) responses: not in the SDK's types."""
+    model_config = ConfigDict(extra="allow")
+
+
 def _dump(obj: Any) -> dict[str, Any]:
     if hasattr(obj, "model_dump"):
         return obj.model_dump(mode="json", exclude_none=True, warnings=False)
@@ -411,6 +501,9 @@ class Backend:
         self.codex_version: str | None = None
         self._models: list[dict[str, Any]] = []
         self._bg: set[asyncio.Task] = set()
+        # thread id → callback for its thread/realtime/* notifications (called
+        # on the reader thread). See open_realtime.
+        self._realtime: dict[str, Any] = {}
         self.started_at = 0  # unix seconds; also the `created` time /v1/models reports
 
     @property
@@ -464,6 +557,9 @@ class Backend:
           * not answer `item/tool/call` at all. It is re-routed into the
             turn's notification stream (TOOL_CALL_METHOD) so run_turn yields a
             ToolCall in order with the rest of the turn.
+          * hand `thread/realtime/*` notifications of a speech session to
+            that session (open_realtime) instead of the SDK's global queue,
+            which nothing reads.
         Everything else is routed exactly as the SDK's own loop does
         (openai_codex/client.py, CodexClient._reader_loop, 0.157.1).
         """
@@ -480,6 +576,12 @@ class Backend:
                             sync._write_message(reply)
                         continue
                     if method is not None:
+                        if isinstance(method, str) and method.startswith("thread/realtime/"):
+                            params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+                            listener = self._realtime.get(params.get("threadId", ""))
+                            if listener is not None:
+                                listener(method, params)
+                                continue
                         if isinstance(method, str):
                             sync._router.route_notification(
                                 sync._coerce_notification(method, msg.get("params")))
@@ -711,6 +813,49 @@ class Backend:
         started = await self.codex._client.request(
             "thread/start", params, response_model=ThreadStartResponse)
         return AsyncThread(self.codex, started.thread.id)
+
+    async def open_realtime(self, *, sdp: str, prompt: str,
+                            voice: str | None = None) -> RealtimeSession:
+        """Start a realtime voice session (audio out) over WebRTC.
+
+        `sdp` is the caller's WebRTC offer; the answer arrives as a
+        RealtimeAnswer event, then the voice speaks on the media track. The
+        thread is chat-only, ephemeral and used for nothing else. The caller
+        must close() the session.
+        """
+        s = settings()
+        thread = await self.codex.thread_start(
+            approval_mode=ApprovalMode.deny_all,
+            sandbox=Sandbox.read_only,
+            cwd=str(s.workspace_dir),
+            base_instructions=prompt,
+            ephemeral=True,
+            config=dict(CHAT_ONLY_CONFIG),
+        )
+        session = RealtimeSession(self, thread.id)
+        loop = asyncio.get_running_loop()
+
+        def deliver(method: str, params: dict[str, Any]) -> None:  # on the reader thread
+            ev = map_realtime(method, params)
+            if ev is not None:
+                loop.call_soon_threadsafe(session.events.put_nowait, ev)
+
+        self._realtime[thread.id] = deliver
+        params: dict[str, Any] = {
+            "outputModality": "audio",
+            "transport": {"type": "webrtc", "sdp": sdp},
+            "version": REALTIME_VERSION,
+            "prompt": prompt,
+            "includeStartupContext": False,
+        }
+        if voice:
+            params["voice"] = voice
+        try:
+            await session._request("thread/realtime/start", params)
+        except BaseException:
+            await session.close()
+            raise
+        return session
 
     async def run_turn(
         self,

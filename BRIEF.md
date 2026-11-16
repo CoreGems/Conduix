@@ -42,9 +42,9 @@ Rust via `reqwest` + SSE.
 - Being a general coding agent. Codex's own shell, file-edit, and patch tools
   are **disabled**, so Conduix behaves like a plain model endpoint.
 - Embeddings, audio, fine-tuning, the Assistants API, and the other Images
-  endpoints (`/v1/images/edits`, `/v1/images/variations`). *Exception
-  planned:* speech output (`/v1/audio/speech`) is step 14 (§3.3). Transcription,
-  translation and audio input stay non-goals.
+  endpoints (`/v1/images/edits`, `/v1/images/variations`). *Exception:*
+  speech output (`/v1/audio/speech`) was added in step 14 (§3.3).
+  Transcription, translation and audio input stay non-goals.
 - Exposing it on a network or supporting more than one user.
 - Automatic Claude↔Codex failover. That idea lives in Conduit's
   `CODEX_INTEGRATION_HOWTO.md`. Conduix is the standalone half it would build on.
@@ -58,7 +58,7 @@ Rust via `reqwest` + SSE.
 | POST   | `/v1/responses`         | OpenAI Responses API (primary; closest to Codex's own model). Optional `session_id`. |
 | POST   | `/v1/chat/completions`  | OpenAI Chat Completions (compat layer over the same core). Optional `session_id`. |
 | POST   | `/v1/images/generations` | OpenAI Images API (a Responses turn with the image tool on, §3.2) |
-| POST   | `/v1/audio/speech`      | *Planned, step 14.* OpenAI text-to-speech over Codex thread realtime (§3.3). Experimental, off by default |
+| POST   | `/v1/audio/speech`      | OpenAI text-to-speech over Codex thread realtime (§3.3). Experimental, off unless `CONDUIX_SPEECH=1` |
 | GET    | `/v1/models`            | Models the logged-in plan can use (from the Codex model list). |
 | GET    | `/v1/sessions`          | List active sessions                                 |
 | POST   | `/v1/sessions`          | Create empty session → `{session_id}`                |
@@ -317,7 +317,9 @@ and WAVs in `scratch/probe_voice_*` and `scratch/probe_webrtc_*`.
   appendAudio | listVoices`, and notifications `thread/realtime/started | sdp
   | outputAudio/delta | transcript/delta | transcript/done | error | closed`.
   The SDK already initializes with `experimentalApi: true`, so raw
-  `client.request(...)` calls reach it.
+  `client.request(...)` calls reach it. Its notifications carry `threadId`
+  but no turn, so the SDK would put them on its global queue; Conduix's
+  reader loop hands them to the speech session instead.
 - **Websocket transport is refused on a ChatGPT login:** `thread/realtime/error`
   "realtime conversation requires API key auth" (bundled 0.157.1 and 0.163.0).
 - **WebRTC transport passes the auth gate** (it goes through ChatGPT's
@@ -326,8 +328,8 @@ and WAVs in `scratch/probe_voice_*` and `scratch/probe_webrtc_*`.
   from `thread/realtime/sdp`. A stub offer gets "Invalid SDP offer".
 - **Only realtime protocol `version: "v3"` works there.** v1 (the default) →
   "AVAS requires OpenAI-Alpha: quicksilver=v2"; v2 → "AVAS realtime calls
-  require realtime v1 or v3". WebRTC + v3 was tested on 0.163.0 only, not
-  on the SDK's bundled 0.157.1.
+  require realtime v1 or v3". WebRTC + v3 works on the SDK's bundled
+  0.157.1 as well as 0.163.0, so no other Codex binary is needed.
 - **Audio comes on the WebRTC media track** (Opus; recorded as 48 kHz
   stereo), not as `outputAudio/delta` notifications. The `oai-events` data
   channel carries `session.started`, `turn.created | delta | done`,
@@ -343,8 +345,14 @@ and WAVs in `scratch/probe_voice_*` and `scratch/probe_webrtc_*`.
 - **Voices** (`thread/realtime/listVoices`): v3 lists `juniper, maple,
   spruce, ember, vale, breeze, arbor, sol, cove, aube, bubbie, haetsal,
   hanul, himari, leher, miko, neer, porto, rindo, rio, rivage, selva, sonna,
-  tinta, viola`. OpenAI's TTS names (`alloy`, `marin`, ...) are v2-only. The
-  `voice` start parameter is untested.
+  tinta, viola`. OpenAI's TTS names (`alloy`, `marin`, ...) are v2-only.
+  The `voice` start parameter is honoured and validated: `marin` gets
+  "realtime voice `marin` is not supported for v3; supported voices: ...",
+  `juniper` works.
+- **Built (step 14), live 2026-11-16 through the `openai` SDK:** a 9-word
+  phrase as WAV (3.1 s of audio, 13 s per request), as MP3 with `juniper`,
+  and a 330-character input as Opus in two chunks (20.7 s of audio, 35 s).
+  All transcripts matched on the first try.
 
 ---
 
@@ -362,7 +370,7 @@ and WAVs in `scratch/probe_voice_*` and `scratch/probe_webrtc_*`.
 | Custom function tools (client-executed)   | ✅ v1.1 | Codex dynamic tools; on a call the response ends with `function_call` and the turn is interrupted; `function_call_output` resumes on a rebuilt thread (§7, verified live 2026-09-27) |
 | Hosted `web_search`                       | ✅ v1.1 | `tools: [{"type": "web_search"}]` / chat `web_search_options` turn Codex's web search on for that thread (`CONDUIX_WEB_SEARCH_MODE`, default `live`); `web_search_call` output items |
 | Image generation (`image_generation` tool, `/v1/images/generations`) | ✅ v1.2 | `tools: [{"type": "image_generation"}]` turns Codex's image tool on for that thread; `image_generation_call` output items with the PNG in `result`. Earlier images are replayed as a user image message (§3.2). `/v1/images/generations` runs the same turn and stops it once the image is in. Not on Chat Completions (no image output shape) or with `session_id`. Tool options are ignored; the images endpoint passes `size` / `background` as a hint |
-| Speech output (`/v1/audio/speech`)        | ⏳ v1.3 | Planned, step 14 (§3.3). A Codex realtime v3 session over WebRTC speaks the input; the transcript is checked against it |
+| Speech output (`/v1/audio/speech`)        | ✅ v1.3 | Experimental, `CONDUIX_SPEECH=1` and `conduix[voice]`. A Codex realtime v3 session over WebRTC reads the input chunk by chunk; each transcript is checked against its chunk (§3.3). All six `response_format`s; no streaming. OpenAI voice names map to the default voice, `speed` and `instructions` are hints |
 | `temperature`, `top_p`, `stop`, `max_output_tokens` | ⚠️ | Accepted. Applied where Codex supports them, otherwise ignored, and the docs list which |
 | Structured outputs (`text.format` json_schema) | ✅ | Passed as the turn's `output_schema`; verified live 2026-09-27. Upstream only accepts strict schemas, and a schema allowing only `{}` never finishes (found live), so it gets a 400 |
 | JSON mode (`json_object`)                 | ✅ | Can't be a schema (no strict "any object"), so it's an instruction on that turn only, plus code-fence stripping done while streaming (`json_safe_prefix`: only an undecided opening fence and a trailing run of backticks/whitespace are held back). Verified live on both endpoints; not guaranteed like json_schema |
@@ -389,6 +397,8 @@ conduix/
   routes/responses.py
   routes/chat.py
   routes/images.py
+  routes/audio.py   POST /v1/audio/speech
+  voice.py          speech: the aiortc WebRTC peer, chunking, transcript check, encoding
   routes/models.py
   routes/sessions.py
 tests/              unit (offline, fake backend) + integration (-m integration)
@@ -413,6 +423,9 @@ start_app.ps1       kill (whole process tree) and restart on port
 | `CONDUIX_SESSION_IDLE_TIMEOUT_S` | `1800`          |
 | `CONDUIX_MAX_SESSIONS`           | `100`           |
 | `CONDUIX_WEB_SEARCH_MODE`        | `live` (or `cached`), used when a request enables web search |
+| `CONDUIX_SPEECH`                 | `false`; `1` turns on `/v1/audio/speech` (experimental) |
+| `CONDUIX_SPEECH_VOICE`           | `cove`, the realtime v3 voice for OpenAI voice names |
+| `CONDUIX_SPEECH_MIN_SIMILARITY`  | `0.8`, how closely a transcript must match its chunk |
 
 **Billing guard:** at startup, call `codex.account()` and refuse to serve
 unless `account.type == "chatgpt"`. Log `plan_type` and show it on
@@ -461,9 +474,15 @@ passes.
     `image_generation` tool on `/v1/responses` (streaming included) and `/v1/images/generations`.
     Verified live: an image through each, a follow-up on the same thread and on a rebuilt one,
     and an edit of an earlier image named by its id.
-14. **v1.3: speech output** (spike done 2026-11-16, findings in §3.3; not built).
+14. ✅ **v1.3: speech output** (done 2026-11-16, findings in §3.3).
     `POST /v1/audio/speech` in OpenAI's shape (`model`, `input`, `voice`,
     `response_format`, `instructions`, `speed`), off unless `CONDUIX_SPEECH=1`.
+    Built as planned below, except: no other Codex binary is needed (the
+    bundled 0.157.1 works); OpenAI voice names map to `CONDUIX_SPEECH_VOICE`
+    and an unknown name is a 400 listing the v3 voices; turned off is a 501
+    `speech_disabled`. Tests: `tests/test_speech.py` (22, offline).
+    Verified live: WAV, MP3 and a two-chunk Opus through
+    `client.audio.speech.create`, and a text turn on the same server.
     - **Peer:** a new `conduix/voice.py` runs one `aiortc` peer per request
       (silent mic track, `oai-events` data channel), starts realtime on a
       fresh chat-only thread with `outputModality: "audio"`, `version: "v3"`,
@@ -484,8 +503,7 @@ passes.
       `instructions` go into the prompt as hints.
     - **Plumbing:** `aiortc` as an optional extra (`pip install
       conduix[voice]`); the endpoint answers 501 when it is missing.
-      Needs a Codex CLI with realtime v3 (0.163.0 tested; set
-      `CONDUIX_CODEX_BIN`). Realtime errors map to the error envelope
+      Realtime errors map to the error envelope
       (usage limit → 429 with reset time). One speech request at a time
       (a lock), so voice sessions don't pile up.
     - **Tests:** offline, extend `tests/fake_app_server.py` with the realtime
@@ -577,7 +595,7 @@ tools through a prompt has no effect on disk.
   - After an image the model's closing message is empty, so the response
     ends with a `message` item whose text is `""`. It is kept in the output
     and left out of the history (stored or resent).
-- **Speech output** (step 14, §3.3):
+- **Speech output** (step 14, §3.3). Still open:
   - Thread realtime is an experimental protocol with internal version gates
     (AVAS, `quicksilver`). A Codex update can break it, so the endpoint stays
     opt-in and fails with a clear 501/502, never silently.
@@ -586,7 +604,10 @@ tools through a prompt has no effect on disk.
     at the cost of a retry.
   - Usage: the session reports `audio_duration_ms` but no plan bucket of its
     own was seen. How fast speech draws on the weekly limit, and what a
-    usage-limit failure looks like, is unknown.
+    usage-limit failure looks like, is unknown. For now a realtime error is
+    a 429 when `account/rateLimits/read` shows a full window (or the message
+    says "usage limit"), otherwise a 502 `speech_failed`.
+  - `speed` is only a hint in the prompt; the audio isn't time-stretched.
   - Each request costs about 6 s of setup before audio. Reusing one warm
     session across requests could cut that but mixes context between
     requests; decide after the first cut.

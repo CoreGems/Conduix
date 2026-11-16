@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     session_idle_timeout_s: int = 30 * 60
     max_sessions: int = 100
 
+    # Speech output, /v1/audio/speech (experimental; needs `conduix[voice]`).
+    speech: bool = False
+    speech_voice: str = "cove"  # a realtime v3 voice; OpenAI's names map to it
+    # How closely a turn's transcript must match its text (0-1, normalized
+    # difflib ratio) before the audio is accepted.
+    speech_min_similarity: float = 0.8
+
 
 @lru_cache
 def settings() -> Settings:

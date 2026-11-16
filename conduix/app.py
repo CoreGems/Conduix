@@ -11,6 +11,7 @@ from conduix import __version__
 from conduix import errors
 from conduix.backend import backend
 from conduix.config import settings
+from conduix.routes.audio import router as audio_router
 from conduix.routes.chat import router as chat_router
 from conduix.routes.images import router as images_router
 from conduix.routes.models import router as models_router
@@ -43,6 +44,7 @@ errors.install(app)
 app.include_router(responses_router)
 app.include_router(chat_router)
 app.include_router(images_router)
+app.include_router(audio_router)
 app.include_router(models_router)
 app.include_router(sessions_router)
 

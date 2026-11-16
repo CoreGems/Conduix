@@ -2,10 +2,10 @@
 
 How to connect a client to Conduix and use it.
 
-> **Status: v1.2, built and tested.** Everything below works against a live
+> **Status: v1.3, built and tested.** Everything below works against a live
 > ChatGPT plan (`openai-codex` 0.157.1): Responses and Chat Completions,
 > streaming, three multi-turn styles, images, image generation, structured
-> output and JSON mode, function tools and web search. Model names and limits
+> output and JSON mode, function tools, web search, and (experimental) speech. Model names and limits
 > depend on the plan that Codex is logged in to.
 
 ---
@@ -78,6 +78,7 @@ A Swagger console for trying requests by hand is at
 | POST   | `/v1/responses`         | **Recommended.** OpenAI Responses API |
 | POST   | `/v1/chat/completions`  | OpenAI Chat Completions, for older clients and tools |
 | POST   | `/v1/images/generations` | OpenAI Images API: generate an image (§8) |
+| POST   | `/v1/audio/speech`      | OpenAI text-to-speech, experimental and off by default (§16) |
 | GET    | `/v1/models`            | Models your plan can use |
 | GET    | `/v1/models/{id}`       | One model, with its supported `effort` values |
 | POST   | `/v1/sessions`          | Create a server-side conversation → `{session_id}` |
@@ -733,7 +734,8 @@ Errors use OpenAI's error envelope:
 | Image generation options (`size`, `quality`, `background`, image `model`, ...) | Can't be enforced. Ignored on the Responses tool; the Images API passes `size` and `background` as a hint (§8) |
 | Images API `n` > 1, `response_format: "url"`, `stream: true` | 400 |
 | Image generation on Chat Completions or with `session_id` | 400 |
-| Embeddings, audio, image edits and variations (`/v1/images/edits`, ...), files, Assistants, batch | Not available |
+| Speech `stream_format: "sse"`, unknown voice names | 400; OpenAI voice names map to the default voice (§16) |
+| Embeddings, transcription and other audio input, image edits and variations (`/v1/images/edits`, ...), files, Assistants, batch | Not available |
 | Parallel requests on one session | Queued, one at a time |
 
 The model has **no access** to your files or shell, and no network access
@@ -761,3 +763,69 @@ beyond the web search you enable. Conduix runs Codex in a locked-down mode:
   history is replayed each time.
 - **It runs alongside Conduit.** Conduit (Claude, Anthropic API) is on `:8765`
   and Conduix (OpenAI API) is on `:8766`.
+
+---
+
+## 16. Speech output (experimental)
+
+`/v1/audio/speech` turns text into audio on your ChatGPT plan. It is **off by
+default**. To turn it on, install the voice extra and start Conduix with
+`CONDUIX_SPEECH=1`:
+
+```powershell
+conda run -n conduix pip install -e ".[voice]"
+$env:CONDUIX_SPEECH = "1"; .\start_app.ps1
+```
+
+```python
+speech = client.audio.speech.create(
+    model="gpt-4o-mini-tts",          # accepted and ignored
+    voice="juniper",                  # a realtime voice, see below
+    input="Hello from Conduix. This is a speech test.",
+    response_format="mp3",            # mp3 (default), opus, aac, flac, wav, pcm
+)
+speech.write_to_file("hello.mp3")
+```
+
+**How it works.** Codex has no text-to-speech model, but it does have a
+realtime voice. Each request opens a voice session over WebRTC, asks the
+voice to read the text word for word, records it, and closes the session.
+Long input is split at sentence ends into chunks of about 250 characters,
+one voice turn each.
+
+**The transcript is checked.** The voice is a conversational model asked to
+read, so it could paraphrase or add words. Conduix compares each chunk's
+transcript with the chunk, tries once more on a mismatch, and otherwise
+returns **502** `speech_mismatch` rather than audio that says something
+else.
+
+**Notes and limits:**
+
+- **Slow to start.** Each request spends about 7 seconds setting up the
+  session before the voice speaks. A short phrase takes about 13 seconds in
+  all; 330 characters took about 35.
+- **One request at a time.** Concurrent requests wait their turn.
+- **Voices.** Use one of the realtime voices: `juniper`, `maple`, `spruce`,
+  `ember`, `vale`, `breeze`, `arbor`, `sol`, `cove`, `aube`, `bubbie`,
+  `haetsal`, `hanul`, `himari`, `leher`, `miko`, `neer`, `porto`, `rindo`,
+  `rio`, `rivage`, `selva`, `sonna`, `tinta`, `viola`. OpenAI's voice names
+  (`alloy`, `marin`, ...) are accepted and use `CONDUIX_SPEECH_VOICE`
+  (`cove`). Any other name returns **400**. The `x-conduix-voice` response
+  header says which voice spoke.
+- **`instructions` and `speed` are hints.** They are passed to the voice as
+  directions ("speak slowly"); the audio isn't time-stretched.
+- **Audio format.** 24 kHz mono. `pcm` is raw 16-bit little-endian samples;
+  `opus` comes in an Ogg container.
+- **No streaming.** `stream_format: "sse"` returns **400**. The audio comes
+  back whole.
+- **Input** up to 4096 characters, as on OpenAI.
+- **Errors.** Turned off returns **501** `speech_disabled`, and a missing
+  voice extra returns **501** `speech_unavailable`. A failed voice session
+  returns **502** `speech_failed`, or **429** if the plan's usage window is
+  full. A session that doesn't start in time returns **504**
+  `speech_timeout`. None of these are retried by the SDK.
+- **It uses your plan's usage limit**, like any other request. How much a
+  second of speech costs hasn't been measured.
+- **Experimental.** It relies on an experimental Codex protocol, so a Codex
+  update can break it. When that happens it fails with one of the errors
+  above, never with silent audio.

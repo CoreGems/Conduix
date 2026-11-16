@@ -27,6 +27,16 @@ Turns answer with a dump of the thread's model-visible history
               as Codex does. IMAGELIMIT fails it on a usage limit instead
     TWICE     two model calls: two thread/tokenUsage/updated notifications
 
+Thread realtime (speech, step 14): thread/realtime/start answers a webrtc
+offer with protocol v3 (anything else fails like the real server: websocket
+needs an API key, v1/v2 are refused, unknown voices are listed). Each
+appendText is "spoken" back as a transcript of the text after its "...: "
+prefix. Keywords in that text:
+
+    MUMBLE   the voice says "Mhm." instead, every time
+    ONCE     says "Mhm." the first time, then the text
+    RTERROR  a thread/realtime/error instead of a transcript
+
 `fake/stats` returns what the server saw, for assertions. Environment:
 FAKE_ACCOUNT=none makes account/read report no login.
 """
@@ -53,7 +63,8 @@ out_lock = threading.Lock()
 threads: dict[str, dict] = {}
 stats: dict = {
     "thread_start_params": [], "injected": [], "turn_start_params": [], "interrupted": [],
-    "unsubscribed": [], "client_replies": [], "api_key_in_env": any(os.environ.get(k) for k in
+    "unsubscribed": [], "client_replies": [],
+    "realtime_start": [], "realtime_text": [], "realtime_stopped": [], "api_key_in_env": any(os.environ.get(k) for k in
                                               ("OPENAI_API_KEY", "CODEX_API_KEY")),
 }
 interrupts: set[str] = set()
@@ -182,6 +193,44 @@ def run_turn(thread_id: str, turn_id: str, input_items: list[dict]) -> None:
     complete("completed")
 
 
+V3_VOICES = ["juniper", "maple", "spruce", "ember", "vale", "breeze", "arbor", "sol", "cove",
+             "aube", "bubbie", "haetsal", "hanul", "himari", "leher", "miko", "neer", "porto",
+             "rindo", "rio", "rivage", "selva", "sonna", "tinta", "viola"]
+realtime_seen: dict[str, int] = {}  # thread id → appendText calls
+
+
+def realtime_start(params: dict) -> None:
+    tid = params["threadId"]
+    transport = params.get("transport") or {"type": "websocket"}
+    voice = params.get("voice")
+    if transport.get("type") != "webrtc":
+        error = "realtime conversation requires API key auth"
+    elif params.get("version") != "v3":
+        error = "AVAS realtime calls require realtime v1 or v3"
+    elif voice is not None and voice not in V3_VOICES:
+        error = f"realtime voice `{voice}` is not supported for v3; supported voices: " +             ", ".join(V3_VOICES)
+    else:
+        error = None
+    if error:
+        notify("thread/realtime/error", {"threadId": tid, "message": error})
+        return
+    notify("thread/realtime/started", {"threadId": tid, "realtimeSessionId": tid,
+                                       "version": "v3"})
+    notify("thread/realtime/sdp", {"threadId": tid, "sdp": "fake-answer:" + transport["sdp"]})
+
+
+def realtime_speak(tid: str, text: str) -> None:
+    n = realtime_seen[tid] = realtime_seen.get(tid, 0) + 1
+    if "RTERROR" in text:
+        notify("thread/realtime/error", {"threadId": tid, "message": "voice backend failed"})
+        return
+    said = text.split(": ", 1)[-1]
+    if "MUMBLE" in text or ("ONCE" in text and n == 1):
+        said = "Mhm."
+    notify("thread/realtime/transcript/done", {"threadId": tid, "role": "assistant",
+                                               "text": " " + said})
+
+
 def handle(method: str, params: dict) -> dict | None:
     if method == "initialize":
         return FIXTURES["initialize"]
@@ -227,6 +276,21 @@ def handle(method: str, params: dict) -> dict | None:
     if method == "turn/interrupt":
         stats["interrupted"].append(params["turnId"])
         interrupts.add(params["turnId"])
+        return {}
+    if method == "thread/realtime/listVoices":
+        return {"voices": {"v1": V3_VOICES[:9], "v2": ["alloy", "marin"], "v3": V3_VOICES,
+                           "defaultV1": "cove", "defaultV2": "marin"}}
+    if method == "thread/realtime/start":
+        stats["realtime_start"].append(params)
+        threading.Timer(0.01, realtime_start, (params,)).start()
+        return {}
+    if method == "thread/realtime/appendText":
+        stats["realtime_text"].append(params["text"])
+        threading.Timer(0.01, realtime_speak, (params["threadId"], params["text"])).start()
+        return {}
+    if method == "thread/realtime/stop":
+        stats["realtime_stopped"].append(params["threadId"])
+        notify("thread/realtime/closed", {"threadId": params["threadId"], "reason": "requested"})
         return {}
     if method == "fake/stats":
         return stats
