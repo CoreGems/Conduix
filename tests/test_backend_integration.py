@@ -64,9 +64,13 @@ async def test_tool_bait_leaves_workspace_empty(be):
 async def test_models_validate_against_live_list(be):
     from conduix.backend import UnknownModelError, UnsupportedEffortError
 
-    assert be.resolve_model("gpt-5.5", "xhigh") == "gpt-5.5"
+    # The plan's models change (gpt-5.5, which this named, was retired), so
+    # the model is the plan's own default and its efforts what it lists.
+    entry = next(m for m in be.cached_models if m["is_default"])
+    model, top = entry["id"], entry["efforts"][-1]
+    assert be.resolve_model(model, top) == model
     with pytest.raises(UnsupportedEffortError):
-        be.resolve_model("gpt-5.5", "ultra")  # gpt-5.5 tops out at xhigh (§3.1)
+        be.resolve_model(model, "no-such-effort")
     with pytest.raises(UnknownModelError):
         be.resolve_model("no-such-model")
 
