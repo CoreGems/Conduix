@@ -3,7 +3,8 @@
 How to connect a client to Conduix and use it.
 
 > **Status: v1.4, built and tested.** Everything below works against a live
-> ChatGPT plan (`openai-codex` 0.157.1): Responses and Chat Completions,
+> ChatGPT plan (tested live on `openai-codex` 0.157.1; now pinned to 0.169.0,
+> where the offline tests pass and Chat Completions was checked live): Responses and Chat Completions,
 > streaming, three multi-turn styles, images, image generation, structured
 > output and JSON mode, function tools, web search, and (experimental) speech
 > and transcription. Model names and limits
@@ -48,7 +49,7 @@ The person running the server needs to have:
      "status": "ok",
      "version": "0.1.0",
      "codex": "ok",
-     "codex_version": "0.157.1",
+     "codex_version": "0.169.0",
      "logged_in": true,
      "account_type": "chatgpt",
      "plan_type": "plus",
