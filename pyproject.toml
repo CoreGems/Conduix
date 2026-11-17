@@ -15,7 +15,7 @@ dependencies = [
   "uvicorn[standard]>=0.30",
   "sse-starlette>=2.1",
   # Pinned exactly: the SDK pins its Codex binary and app-server is experimental.
-  "openai-codex==0.157.1",
+  "openai-codex==0.169.0",
   "openai>=1.50",
   "pydantic>=2.7",
   "pydantic-settings>=2.4",
